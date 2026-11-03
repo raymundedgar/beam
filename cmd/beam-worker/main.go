@@ -74,9 +74,11 @@ func serve(arguments []string) {
 	nodeID := flags.String("node-id", os.Getenv("BEAM_NODE_ID"), "BeamLink node identity")
 	addr := flags.String("addr", "127.0.0.1:8780", "owner-local control listen address")
 	token := flags.String("control-token", os.Getenv("BEAM_WORKER_CONTROL_TOKEN"), "bearer token for the local control API; generated in the state directory when empty")
-	memory := flags.Int64("memory-bytes", 512<<20, "reservable memory")
-	scratch := flags.Int64("scratch-bytes", 10<<30, "reservable scratch bytes")
-	bandwidth := flags.Int64("bandwidth-mbps", 100, "reservable bandwidth")
+	memory := flags.Int64("memory-bytes", envInt64OrDefault("BEAM_WORKER_MEMORY_BYTES", 2<<30), "reservable memory")
+	scratch := flags.Int64("scratch-bytes", envInt64OrDefault("BEAM_WORKER_SCRATCH_BYTES", 10<<30), "reservable scratch bytes")
+	bandwidth := flags.Int64("bandwidth-mbps", envInt64OrDefault("BEAM_WORKER_BANDWIDTH_MBPS", 10_000), "reservable bandwidth")
+	cpuMillis := flags.Int64("cpu-millis", envInt64OrDefault("BEAM_WORKER_CPU_MILLIS", 8_000), "reservable CPU millicores")
+	connections := flags.Int64("connections", envInt64OrDefault("BEAM_WORKER_CONNECTIONS", 4096), "reservable connections and streams")
 	capabilityList := flags.String("capabilities", "transfer.multipart,transfer.multipart.fanout.v1,transfer.authenticated_part.v1,transfer.source_digest.v1,room.transfer,room.transfer.direct.v1,room.transfer.e2ee.v2,storage.probe.relay.v2", "comma-separated enabled capabilities")
 	statePath := flags.String("state", "data/worker/workloads.json", "durable workload journal")
 	actionRoot := flags.String("action-root", os.Getenv("BEAM_ACTION_ROOT"), "root of checksum-pinned Studio actions")
@@ -156,8 +158,8 @@ func serve(arguments []string) {
 	capabilities := splitList(*capabilityList)
 	var circuitService *circuit.Service
 	governor, err := resources.NewGovernor(domain.Resources{
-		CPUMillis: 1000, MemoryBytes: *memory, ScratchBytes: *scratch,
-		BandwidthMbps: *bandwidth, Connections: 1024, Streams: 1024,
+		CPUMillis: *cpuMillis, MemoryBytes: *memory, ScratchBytes: *scratch,
+		BandwidthMbps: *bandwidth, Connections: *connections, Streams: *connections,
 	})
 	if err != nil {
 		log.Fatal(err)
@@ -192,11 +194,18 @@ func serve(arguments []string) {
 			log.Fatal(registerErr)
 		}
 	}
+	registerInProcess := func(handler runtime.Handler) {
+		if registerErr := registry.Register(handler); registerErr != nil {
+			log.Fatal(registerErr)
+		}
+	}
 	if contains(capabilities, "transfer.multipart") {
-		registerHandler(transfer.NewHandler(nil))
+		// Transfer workloads are concurrent HTTP copies. Running them in the
+		// worker process avoids a fork/exec on every chunk.
+		registerInProcess(transfer.NewHandler(nil))
 	}
 	if contains(capabilities, contracts.TransferSourceDigestCapability) {
-		registerHandler(transfer.NewSourceDigestHandler(nil))
+		registerInProcess(transfer.NewSourceDigestHandler(nil))
 	}
 	if contains(capabilities, "transfer.distribute") {
 		registerHandler(distributionhandler.NewHandler(func() distributionhandler.Transport {
@@ -467,6 +476,18 @@ func envIntOrDefault(name string, fallback int) int {
 		return fallback
 	}
 	parsed, err := strconv.Atoi(value)
+	if err != nil {
+		return fallback
+	}
+	return parsed
+}
+
+func envInt64OrDefault(name string, fallback int64) int64 {
+	value := strings.TrimSpace(os.Getenv(name))
+	if value == "" {
+		return fallback
+	}
+	parsed, err := strconv.ParseInt(value, 10, 64)
 	if err != nil {
 		return fallback
 	}

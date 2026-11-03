@@ -24,7 +24,7 @@ import (
 
 const (
 	// DefaultMaxConcurrent bounds concurrent relays per worker.
-	DefaultMaxConcurrent = 4
+	DefaultMaxConcurrent = 32
 	connectTimeout       = 10 * time.Second
 )
 

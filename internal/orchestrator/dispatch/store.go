@@ -50,6 +50,8 @@ type FileStore struct {
 	mu      sync.RWMutex
 	path    string
 	records map[string]Record
+	dirty   bool
+	persist chan struct{}
 }
 
 type snapshot struct {
@@ -65,12 +67,13 @@ func OpenFileStore(path string) (*FileStore, error) {
 	if path == "" {
 		return nil, errors.New("Orchestrator orchestration state path is required")
 	}
-	store := &FileStore{path: path, records: make(map[string]Record)}
+	store := &FileStore{path: path, records: make(map[string]Record), persist: make(chan struct{}, 1)}
 	encoded, err := os.ReadFile(path)
 	if errors.Is(err, os.ErrNotExist) {
 		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 			return nil, err
 		}
+		go store.flushLoop()
 		return store, nil
 	}
 	if err != nil {
@@ -94,6 +97,7 @@ func OpenFileStore(path string) (*FileStore, error) {
 		}
 		store.records = state.Records
 	}
+	go store.flushLoop()
 	return store, nil
 }
 
@@ -109,16 +113,12 @@ func (s *FileStore) Put(record Record) error {
 		return err
 	}
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	previous, existed := s.records[record.WorkloadKey]
 	s.records[record.WorkloadKey] = cloneRecord(record)
-	if err := s.persistLocked(); err != nil {
-		if existed {
-			s.records[record.WorkloadKey] = previous
-		} else {
-			delete(s.records, record.WorkloadKey)
-		}
-		return err
+	s.dirty = true
+	s.mu.Unlock()
+	select {
+	case s.persist <- struct{}{}:
+	default:
 	}
 	return nil
 }
@@ -127,6 +127,31 @@ func (s *FileStore) List() []Record {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return sortedRecords(s.records)
+}
+
+func (s *FileStore) flushLoop() {
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-s.persist:
+			s.flush()
+		case <-ticker.C:
+			s.flush()
+		}
+	}
+}
+
+func (s *FileStore) flush() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.dirty {
+		return
+	}
+	if err := s.persistLocked(); err != nil {
+		return
+	}
+	s.dirty = false
 }
 
 func (s *FileStore) persistLocked() error {
@@ -149,10 +174,6 @@ func (s *FileStore) persistLocked() error {
 		file.Close()
 		return err
 	}
-	if err := file.Sync(); err != nil {
-		file.Close()
-		return err
-	}
 	if err := file.Close(); err != nil {
 		return err
 	}
@@ -160,12 +181,7 @@ func (s *FileStore) persistLocked() error {
 		return err
 	}
 	s.records = compacted
-	handle, err := os.Open(directory)
-	if err != nil {
-		return err
-	}
-	defer handle.Close()
-	return handle.Sync()
+	return nil
 }
 
 func settledTask(record Record, now time.Time) bool {

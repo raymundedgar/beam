@@ -35,7 +35,7 @@ func relayVectorIntent() map[string]any {
 
 var relayVectorNow = time.Date(2026, 10, 1, 12, 0, 10, 0, time.UTC)
 
-func beamCorePayload(t *testing.T, payload map[string]any) []byte {
+func beamCorePayload(t testing.TB, payload map[string]any) []byte {
 	t.Helper()
 	encoded, err := msgpack.Marshal(payload)
 	if err != nil {

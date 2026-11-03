@@ -44,6 +44,10 @@ env/
 *.env
 !.env.example
 
+# Live miner runtime — binaries, keys, tokens, task state
+/bin/
+/data/
+
 # Logs
 logs/
 *.log

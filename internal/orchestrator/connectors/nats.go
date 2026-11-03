@@ -39,13 +39,55 @@ type NATSConfig struct {
 
 const duplicateControlSessionError = "duplicate_control_session: an offer-bearing NATS connection is already active for this hotkey"
 
-var errDuplicateControlSession = errors.New(duplicateControlSessionError)
+const beamCoreNATSAuthHelp = "set BEAMCORE_NATS_USER to the orchestrator hotkey and BEAMCORE_NATS_PASSWORD to the API key returned by POST /orchestrators/register"
+
+var (
+	errDuplicateControlSession = errors.New(duplicateControlSessionError)
+	errBeamCoreNATSAuthMissing = errors.New("BeamCore NATS credentials are required: " + beamCoreNATSAuthHelp)
+	errNATSControlClosed       = errors.New("BeamCore NATS control connection closed")
+)
 
 func connectBeamCoreNATS(ctx context.Context, config NATSConfig) (*natsConnector, error) {
-	config.InboxPrefix = beamCoreInboxPrefix(config.Hotkey)
+	config = prepareBeamCoreNATSConfig(config)
+	if err := config.beamCoreAuthError(); err != nil {
+		return nil, err
+	}
 	return retryDuplicateControlSession(ctx, 20*time.Second, 500*time.Millisecond, func() (*natsConnector, error) {
-		return connectNATS(config)
+		session, err := connectNATS(config)
+		if err != nil && isNATSAuthorizationError(err) && !errors.Is(err, errDuplicateControlSession) {
+			return nil, fmt.Errorf("%w; %s", err, beamCoreNATSAuthHelp)
+		}
+		return session, err
 	})
+}
+
+func prepareBeamCoreNATSConfig(config NATSConfig) NATSConfig {
+	config.URL = strings.TrimSpace(config.URL)
+	config.User = strings.TrimSpace(config.User)
+	config.Password = strings.TrimSpace(config.Password)
+	config.Token = strings.TrimSpace(config.Token)
+	config.CredentialsFile = strings.TrimSpace(config.CredentialsFile)
+	config.Hotkey = strings.TrimSpace(config.Hotkey)
+	config.PublicAPIURL = strings.TrimSpace(config.PublicAPIURL)
+	if config.User == "" {
+		config.User = config.Hotkey
+	}
+	config.InboxPrefix = beamCoreInboxPrefix(config.Hotkey)
+	return config
+}
+
+func (c NATSConfig) beamCoreAuthError() error {
+	if !isTLSNATSURL(c.URL) {
+		return nil
+	}
+	if c.CredentialsFile != "" || c.Token != "" || (c.User != "" && c.Password != "") {
+		return nil
+	}
+	return errBeamCoreNATSAuthMissing
+}
+
+func isTLSNATSURL(url string) bool {
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(url)), "tls://")
 }
 
 func retryDuplicateControlSession(ctx context.Context, maxWait, retryWait time.Duration,
@@ -121,7 +163,7 @@ func connectNATS(config NATSConfig) (*natsConnector, error) {
 		}
 		options = append(options, nats.UserInfo(config.User, config.Password))
 	}
-	if strings.HasPrefix(strings.ToLower(strings.TrimSpace(config.URL)), "tls://") {
+	if isTLSNATSURL(config.URL) {
 		// Production gateways (orch-gateway.b1m.ai:4222) expect the TLS handshake before the INFO line.
 		options = append(options, nats.TLSHandshakeFirst())
 	}

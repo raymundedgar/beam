@@ -1,0 +1,59 @@
+# Colocate orchestrator and worker on one VPS.
+# 1. Copy .env.example to .env and fill IDs, keys, public hostname/IP.
+# 2. ./generate-wcp-tls.sh "$BEAM_PUBLIC_HOST"
+# 3. docker compose -f deploy/vps/docker-compose.yml up -d --build
+
+services:
+  orchestrator:
+    build:
+      context: ../..
+      dockerfile: actors/orchestrator/Dockerfile
+    restart: unless-stopped
+    network_mode: host
+    env_file: .env
+    environment:
+      BEAM_ENV: prod
+      CORE_SERVER_URL: https://beamcore.b1m.ai
+      BEAMCORE_NATS_URL: tls://orch-gateway.b1m.ai:4222
+      BEAM_WCP_LISTEN_ADDR: 0.0.0.0:8782
+      BEAM_WCP_TLS_CERT: /data/wcp.crt
+      BEAM_WCP_TLS_KEY: /data/wcp.key
+      BEAM_ROOM_TUNNEL_COORDINATOR_URL: https://coordinator.b1m.ai
+    volumes:
+      - ./data/orchestrator:/app/data/orchestrator
+      - ./data/wcp.crt:/data/wcp.crt:ro
+      - ./data/wcp.key:/data/wcp.key:ro
+    command: ["serve", "--hotkey", "${BEAM_BITTENSOR_HOTKEY}", "--netuid", "105", "--addr", "127.0.0.1:8781"]
+
+  worker:
+    build:
+      context: ../..
+      dockerfile: actors/worker/Dockerfile
+    restart: unless-stopped
+    network_mode: host
+    depends_on:
+      - orchestrator
+    env_file: .env
+    environment:
+      BEAM_WCP_ADDRESS: 127.0.0.1:8782
+      BEAM_WCP_CA: /data/wcp.crt
+      BEAM_WCP_SERVER_NAME: ${BEAM_WCP_SERVER_NAME:-localhost}
+      BEAM_WORKER_BANDWIDTH_MBPS: ${BEAM_WORKER_BANDWIDTH_MBPS:-10000}
+      BEAM_WORKER_MEMORY_BYTES: ${BEAM_WORKER_MEMORY_BYTES:-2147483648}
+      BEAM_WORKER_CONNECTIONS: ${BEAM_WORKER_CONNECTIONS:-4096}
+      BEAM_WORKER_SUBSYSTEM_MODE: integrated
+    volumes:
+      - ./data/worker:/app/data/worker
+      - ./data/wcp.crt:/data/wcp.crt:ro
+    command:
+      - serve
+      - --node-key
+      - data/worker/node.key
+      - --capabilities
+      - transfer.multipart,transfer.multipart.fanout.v1,transfer.authenticated_part.v1,transfer.source_digest.v1,room.transfer,room.transfer.direct.v1,room.transfer.e2ee.v2,storage.probe.relay.v2
+      - --room-transfer-addr
+      - 0.0.0.0:9470
+      - --room-transfer-advertise-url
+      - ${BEAM_ROOM_TRANSFER_ADVERTISE_URL}
+      - --subsystem-mode
+      - integrated

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
@@ -91,6 +92,45 @@ func TestHasActiveDuplicateControlSessionRequiresValidMatchingIdentity(t *testin
 	}
 	if duplicate {
 		t.Fatal("invalid credentials must not be reported as a duplicate control session")
+	}
+}
+
+func TestPrepareBeamCoreNATSConfigDefaultsUserFromHotkey(t *testing.T) {
+	config := prepareBeamCoreNATSConfig(NATSConfig{
+		URL:      " tls://orch-gateway.b1m.ai:4222 ",
+		Hotkey:   " 5Hotkey ",
+		Password: " api-key ",
+	})
+	if config.User != "5Hotkey" || config.Password != "api-key" || config.URL != "tls://orch-gateway.b1m.ai:4222" {
+		t.Fatalf("defaults were not applied: %+v", config)
+	}
+	if config.InboxPrefix != "_INBOX.o."+strings.ToLower("5Hotkey") {
+		t.Fatalf("inbox prefix=%q", config.InboxPrefix)
+	}
+}
+
+func TestBeamCoreTLSAuthIsRequired(t *testing.T) {
+	config := prepareBeamCoreNATSConfig(NATSConfig{URL: "tls://orch-gateway.b1m.ai:4222", Hotkey: "hotkey-1"})
+	if err := config.beamCoreAuthError(); !errors.Is(err, errBeamCoreNATSAuthMissing) {
+		t.Fatalf("missing TLS credentials error=%v", err)
+	}
+	config.Password = "api-key"
+	if err := config.beamCoreAuthError(); err != nil {
+		t.Fatalf("hotkey+password should be enough: %v", err)
+	}
+	local := prepareBeamCoreNATSConfig(NATSConfig{URL: "nats://127.0.0.1:4222"})
+	if err := local.beamCoreAuthError(); err != nil {
+		t.Fatalf("local nats:// must not require BeamCore credentials: %v", err)
+	}
+}
+
+func TestConnectBeamCoreNATSRejectsMissingTLSCredentials(t *testing.T) {
+	_, err := connectBeamCoreNATS(context.Background(), NATSConfig{
+		URL:  "tls://orch-gateway.b1m.ai:4222",
+		Name: "beam-orchestrator-beamcore",
+	})
+	if !errors.Is(err, errBeamCoreNATSAuthMissing) {
+		t.Fatalf("connect error=%v", err)
 	}
 }
 

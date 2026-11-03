@@ -79,7 +79,7 @@ func NewServerWithJournal(orchestratorID string, orchestratorRegistry *registry.
 	server := &Server{
 		orchestratorID: orchestratorID, registry: orchestratorRegistry, control: controlService,
 		sessions: make(map[string]*Session), pending: make(map[string]chan runtime.Decision),
-		results: make(chan ResultEvent, 256), progress: make(chan ProgressEvent, 256), checkpoints: make(chan CheckpointEvent, 256), receipts: make(chan ReceiptEvent, 256), journal: journal,
+		results: make(chan ResultEvent, 2048), progress: make(chan ProgressEvent, 2048), checkpoints: make(chan CheckpointEvent, 2048), receipts: make(chan ReceiptEvent, 2048), journal: journal,
 		circuits: make(map[string]circuit.Plan), revoked: make(map[string]revokedCircuit),
 		relays: make(map[string]*serverRelay),
 	}

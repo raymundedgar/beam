@@ -42,10 +42,13 @@ func newClient(timeout time.Duration, allowed func(netip.AddrPort) bool) *http.C
 		Proxy:                 nil,
 		DialContext:           dialer.DialContext,
 		ForceAttemptHTTP2:     true,
-		MaxIdleConns:          100,
+		MaxIdleConns:          4096,
+		MaxIdleConnsPerHost:   256,
+		MaxConnsPerHost:       0,
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: time.Second,
+		DisableCompression:    true,
 	}
 	return &http.Client{Timeout: timeout, Transport: transport, CheckRedirect: checkRedirect}
 }

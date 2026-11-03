@@ -1,0 +1,19 @@
+[Unit]
+Description=Beam worker
+After=network-online.target beam-orchestrator.service
+Wants=network-online.target
+Requires=beam-orchestrator.service
+
+[Service]
+Type=simple
+WorkingDirectory=/root/beam
+EnvironmentFile=/root/beam/.env
+ExecStart=/root/beam/bin/beam-worker serve --node-key data/worker/node.key --capabilities ${BEAM_WORKER_CAPABILITIES} --room-transfer-addr ${BEAM_ROOM_TRANSFER_ADDR} --room-transfer-advertise-url ${BEAM_ROOM_TRANSFER_ADVERTISE_URL} --subsystem-mode ${BEAM_WORKER_SUBSYSTEM_MODE}
+Restart=always
+RestartSec=2
+KillSignal=SIGTERM
+TimeoutStopSec=20
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -60,12 +61,19 @@ type Config struct {
 	Now               func() time.Time
 }
 
+// FailureAlerter is notified when a dispatched task fails, is cancelled, or is rejected.
+type FailureAlerter interface {
+	AlertUnsuccessful(kind, state, detail string)
+}
+
 type Service struct {
 	config      Config
 	registry    *registry.Registry
 	scheduler   *scheduling.Scheduler
 	control     Control
 	store       Store
+	alerter     FailureAlerter
+	alerted     map[string]struct{}
 	recordLocks [64]sync.Mutex
 	// Serialize upstream events separately. A callback may enter room state
 	// whose lock is held by a concurrent Dispatch or CancelWorkload call.
@@ -93,7 +101,12 @@ func NewService(config Config, orchestratorRegistry *registry.Registry, control 
 		config.Now = time.Now
 	}
 	return &Service{config: config, registry: orchestratorRegistry, scheduler: scheduling.New(orchestratorRegistry),
-		control: control, store: store, sinks: make(map[Source]ResultSink), subscribers: make(map[uint64]chan Event)}, nil
+		control: control, store: store, alerted: make(map[string]struct{}), sinks: make(map[Source]ResultSink),
+		subscribers: make(map[uint64]chan Event)}, nil
+}
+
+func (s *Service) SetFailureAlerter(alerter FailureAlerter) {
+	s.alerter = alerter
 }
 
 func (s *Service) RegisterSink(source Source, sink ResultSink) {
@@ -512,7 +525,41 @@ func (s *Service) save(record Record, message string) error {
 		}
 	}
 	s.mu.RUnlock()
+	s.alertIfUnsuccessful(record)
 	return nil
+}
+
+func (s *Service) alertIfUnsuccessful(record Record) {
+	if s.alerter == nil {
+		return
+	}
+	switch record.State {
+	case StateFailed, StateCancelled, StateRejected:
+	default:
+		return
+	}
+	key := record.WorkloadKey + "|" + string(record.State)
+	s.mu.Lock()
+	if _, exists := s.alerted[key]; exists {
+		s.mu.Unlock()
+		return
+	}
+	s.alerted[key] = struct{}{}
+	s.mu.Unlock()
+	kind := string(record.Spec.Kind)
+	if kind == "" {
+		kind = "-"
+	}
+	detail := record.UpstreamError
+	if record.Result != nil {
+		if record.Result.ErrorCode != "" {
+			detail = strings.TrimSpace(detail + " " + record.Result.ErrorCode)
+		}
+		if record.Result.ErrorMessage != "" {
+			detail = strings.TrimSpace(detail + " " + record.Result.ErrorMessage)
+		}
+	}
+	go s.alerter.AlertUnsuccessful(kind, string(record.State), detail)
 }
 
 func randomToken(size int) (string, error) {

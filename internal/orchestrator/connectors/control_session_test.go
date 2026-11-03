@@ -210,3 +210,30 @@ func TestRoomControlBindCleansPartialSubscriptionOnFlushFailure(t *testing.T) {
 		t.Fatal("control subscription flush did not receive a deadline")
 	}
 }
+
+func TestRoomControlRunReturnsErrorWhenNATSCloses(t *testing.T) {
+	now := time.Date(2026, 9, 14, 12, 0, 0, 0, time.UTC)
+	orchestratorRegistry, err := registry.New(orchestratordomain.Orchestrator{OrchestratorID: "orch-1", CreatedAt: now})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tasks, err := dispatch.NewService(
+		dispatch.Config{OrchestratorID: "orch-1", Now: func() time.Time { return now }},
+		orchestratorRegistry,
+		fakeControlWCP{},
+		dispatch.NewMemoryStore(),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	control := newRoomControl(
+		NATSConfig{Environment: "dev", Hotkey: "hotkey-1", GatewayURL: "http://gateway.test", RequestTimeout: time.Second},
+		nil, nil, nil, tasks,
+	)
+	control.conn = &fakeRoomControlConnection{}
+	session := &roomControlSession{control: control, messages: make(chan *nats.Msg, 1)}
+	session.messages <- nil
+	if err := session.run(context.Background()); !errors.Is(err, errNATSControlClosed) {
+		t.Fatalf("run error=%v", err)
+	}
+}

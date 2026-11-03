@@ -141,3 +141,10 @@ func TestNewClientIgnoresEnvironmentProxy(t *testing.T) {
 		t.Fatal("storage client uses an environment proxy")
 	}
 }
+
+func TestNewClientPoolsManyIdleConnectionsPerHost(t *testing.T) {
+	transport := NewClient(time.Second).Transport.(*http.Transport)
+	if transport.MaxIdleConnsPerHost < 64 || transport.MaxIdleConns < transport.MaxIdleConnsPerHost {
+		t.Fatalf("storage client idle pool is too small: idle=%d per_host=%d", transport.MaxIdleConns, transport.MaxIdleConnsPerHost)
+	}
+}

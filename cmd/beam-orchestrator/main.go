@@ -18,6 +18,7 @@ import (
 
 	"github.com/Beam-Network/beam/internal/beamlink/wcp"
 	"github.com/Beam-Network/beam/internal/localauth"
+	"github.com/Beam-Network/beam/internal/notify"
 	"github.com/Beam-Network/beam/internal/orchestrator/connectors"
 	"github.com/Beam-Network/beam/internal/orchestrator/dispatch"
 	orchestratordomain "github.com/Beam-Network/beam/internal/orchestrator/domain"
@@ -75,7 +76,13 @@ func serve(arguments []string) {
 		"beam.workloads.tunnel.results", "beam-orchestrator-tunnel")
 	flags.StringVar(&tunnelNATS.ProvisionSubject, "tunnel-nats-provision-subject", "beam.workloads.tunnel.provision", "Tunnel coordinator room lease request/reply subject")
 	_ = flags.Parse(arguments)
-	beamCoreNATS.Hotkey = *hotkey
+	beamCoreNATS.Hotkey = strings.TrimSpace(*hotkey)
+	if strings.TrimSpace(beamCoreNATS.User) == "" {
+		beamCoreNATS.User = beamCoreNATS.Hotkey
+	}
+	if strings.TrimSpace(beamCoreNATS.PublicAPIURL) == "" {
+		beamCoreNATS.PublicAPIURL = envOrDefault("CORE_SERVER_URL", "https://beamcore.b1m.ai")
+	}
 	controlTokenPath := filepath.Join(filepath.Dir(*statePath), "control-token")
 	controlToken, err := localauth.ResolveToken(*controlTokenFlag, controlTokenPath)
 	if err != nil {
@@ -125,6 +132,10 @@ func serve(arguments []string) {
 		tasks, err = dispatch.NewService(dispatch.Config{OrchestratorID: orchestrator.OrchestratorID}, orchestratorRegistry, wcpServer, store)
 		if err != nil {
 			log.Fatal(err)
+		}
+		if alerter := notify.FromEnv(); alerter != nil {
+			tasks.SetFailureAlerter(alerter)
+			log.Printf("Pushover alerts enabled for unsuccessful tasks")
 		}
 		server.AttachOrchestration(tasks)
 		roomStore, roomErr := roomtransfer.OpenFileStore(*roomTransferState)

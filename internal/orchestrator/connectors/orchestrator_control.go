@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Beam-Network/beam/internal/orchestrator/dispatch"
@@ -20,6 +21,8 @@ import (
 )
 
 const DefaultControlPrefix = "beam.orch.control.v2"
+
+const taskOfferDispatchParallelism = 64
 
 var (
 	controlHeartbeatInterval     = 15 * time.Second
@@ -219,13 +222,16 @@ func (session *roomControlSession) run(ctx context.Context) error {
 			return err
 		case message := <-session.messages:
 			if message == nil {
-				return nil
+				return errNATSControlClosed
 			}
 			switch messageType := message.Subject[strings.LastIndex(message.Subject, ".")+1:]; messageType {
 			case "task_offer_batch":
-				if err := control.handleTaskOfferBatch(ctx, message.Data); err != nil {
-					log.Printf("ignore invalid BeamCore task_offer_batch: %v", err)
-				}
+				payload := append([]byte(nil), message.Data...)
+				go func() {
+					if err := control.handleTaskOfferBatch(ctx, payload); err != nil {
+						log.Printf("ignore invalid BeamCore task_offer_batch: %v", err)
+					}
+				}()
 			case "task_offer_batch_cancel":
 				if err := control.handleTaskOfferBatchCancel(ctx, message.Data); err != nil {
 					log.Printf("ignore invalid BeamCore task_offer_batch_cancel: %v", err)
@@ -243,9 +249,12 @@ func (session *roomControlSession) run(ctx context.Context) error {
 					log.Printf("ignore invalid BeamCore room cancellation: %v", err)
 				}
 			case "room_task_offer_batch":
-				if err := control.handleOffer(ctx, message.Data); err != nil {
-					log.Printf("ignore invalid BeamCore room transfer offer: %v", err)
-				}
+				payload := append([]byte(nil), message.Data...)
+				go func() {
+					if err := control.handleOffer(ctx, payload); err != nil {
+						log.Printf("ignore invalid BeamCore room transfer offer: %v", err)
+					}
+				}()
 			default:
 				log.Printf("ignore BeamCore control message of unknown type %q", messageType)
 			}
@@ -397,14 +406,28 @@ func (control *roomControl) handleTaskOfferBatch(ctx context.Context, encoded []
 		}
 		specs = append(specs, spec)
 	}
-	var failures []error
-	for _, spec := range specs {
-		if _, err := control.tasks.Dispatch(ctx, dispatch.DispatchRequest{
-			Source: dispatch.SourceBeamCore, ExternalID: spec.AttemptID, BatchID: batch.BatchID, TransferID: batch.TransferID, Spec: spec,
-		}); err != nil {
-			failures = append(failures, fmt.Errorf("offer %s: %w", spec.AttemptID, err))
-		}
+	failures := make([]error, len(specs))
+	slots := make(chan struct{}, taskOfferDispatchParallelism)
+	var wait sync.WaitGroup
+	for index, spec := range specs {
+		wait.Add(1)
+		go func(index int, spec domain.Spec) {
+			defer wait.Done()
+			select {
+			case slots <- struct{}{}:
+				defer func() { <-slots }()
+			case <-ctx.Done():
+				failures[index] = fmt.Errorf("offer %s: %w", spec.AttemptID, ctx.Err())
+				return
+			}
+			if _, err := control.tasks.Dispatch(ctx, dispatch.DispatchRequest{
+				Source: dispatch.SourceBeamCore, ExternalID: spec.AttemptID, BatchID: batch.BatchID, TransferID: batch.TransferID, Spec: spec,
+			}); err != nil {
+				failures[index] = fmt.Errorf("offer %s: %w", spec.AttemptID, err)
+			}
+		}(index, spec)
 	}
+	wait.Wait()
 	return errors.Join(failures...)
 }
 

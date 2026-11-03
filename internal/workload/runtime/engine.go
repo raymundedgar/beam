@@ -63,8 +63,8 @@ func NewEngine(workerID string, capabilities []string, registry *Registry, gover
 	return &Engine{
 		workerID: workerID, capabilities: capabilitySet, registry: registry,
 		governor: governor, store: store, now: time.Now,
-		cancels: make(map[string]context.CancelFunc), results: make(chan domain.Result, 64), resultSaved: make(chan struct{}, 1),
-		progress: make(chan domain.Progress, 128), checkpoints: make(chan domain.Checkpoint, 128),
+		cancels: make(map[string]context.CancelFunc), results: make(chan domain.Result, 1024), resultSaved: make(chan struct{}, 1),
+		progress: make(chan domain.Progress, 1024), checkpoints: make(chan domain.Checkpoint, 1024),
 	}, nil
 }
 

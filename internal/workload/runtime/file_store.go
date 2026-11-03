@@ -153,27 +153,13 @@ func (s *FileStore) appendLocked(record Record) error {
 		_ = file.Close()
 		return err
 	}
-	if err = json.NewEncoder(file).Encode(workloadFrame{Record: record}); err == nil {
-		err = file.Sync()
-	}
-	if err != nil {
+	if err = json.NewEncoder(file).Encode(workloadFrame{Record: record}); err != nil {
 		_ = file.Truncate(info.Size())
 		_ = file.Close()
 		return err
 	}
 	if err := file.Close(); err != nil {
 		return err
-	}
-	if info.Size() == 0 {
-		handle, err := os.Open(filepath.Dir(path))
-		if err != nil {
-			return err
-		}
-		err = handle.Sync()
-		_ = handle.Close()
-		if err != nil {
-			return err
-		}
 	}
 	s.operations++
 	s.records = compactReceiptCommittedWorkloads(s.records, maxRetainedReceiptCommittedWorkloads)

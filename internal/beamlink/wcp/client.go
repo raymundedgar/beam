@@ -56,10 +56,10 @@ type Client struct {
 
 const sessionLogInterval = time.Minute
 
-const maxOutstandingReceiptReplays = 4
+const maxOutstandingReceiptReplays = 32
 const receiptReplayInterval = 2 * time.Second
 
-const maxWorkloadReplayBatch = 8
+const maxWorkloadReplayBatch = 64
 
 func NewClient(config ClientConfig) (*Client, error) {
 	if config.Address == "" || config.TLSConfig == nil || len(config.PrivateKey) != ed25519.PrivateKeySize {
