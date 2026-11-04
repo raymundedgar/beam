@@ -1,9 +1,9 @@
 #!/bin/bash
 # Task size, duration, throughput, and stall hints (disk / memory / cpu / network).
 #
-#   ./throughput.sh          snapshot
+#   ./throughput.sh          last wave
 #   ./throughput.sh watch    refresh every 2s and sample the host during in-flight work
-#   ./throughput.sh all      every local task, not just recent / slow
+#   ./throughput.sh all      every local task
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -440,6 +440,10 @@ def enrich(task, samples, live, medians):
     nbytes = task_bytes(task)
     start, end = task_window(task)
     seconds = (end - start).total_seconds() if start and end else None
+    # A refusal is recorded in a few milliseconds. Offered size over that
+    # interval is not a transfer rate.
+    if state == "rejected":
+        seconds = None
     mib_s = (nbytes / MIB / seconds) if nbytes and seconds and seconds > 0 else None
     median = medians.get(kind)
     slow = bool(mib_s is not None and median and mib_s < 0.5 * median and seconds >= 2)
@@ -453,6 +457,7 @@ def enrich(task, samples, live, medians):
         "slow": slow,
         "stall": stall,
         "updated": parse_time(task.get("updated_at")),
+        "created": parse_time(task.get("created_at")),
         "in_flight": state in IN_FLIGHT,
         "id": (task.get("external_id") or "")[:10],
     }
@@ -536,20 +541,77 @@ def write_unsuccessful(tasks):
     with open(UNSUCCESSFUL_PATH, "w", encoding="utf-8") as fh:
         fh.write("\n".join(lines) + "\n")
 
-def print_table(title, rows):
-    print(f"\n{title}")
+# Offers in one burst land together. A gap longer than this starts the next wave.
+WAVE_GAP = timedelta(minutes=2)
+
+def last_wave(rows):
+    stamped = [row for row in rows if row.get("created")]
+    if not stamped:
+        return rows
+    stamped.sort(key=lambda row: row["created"])
+    wave = [stamped[-1]]
+    for row in reversed(stamped[:-1]):
+        if wave[-1]["created"] - row["created"] > WAVE_GAP:
+            break
+        wave.append(row)
+    wave.reverse()
+    return wave
+
+def print_rows(rows):
     if not rows:
         print("  (none)")
         return
     print(f"  {'KIND':<32} {'STATE':<10} {'SIZE':>10} {'TIME':>8} {'RATE':>10}  {'STALL':<10} {'UPDATED'}")
     print("  " + "-" * 98)
     for row in rows:
-        mark = "*" if row["slow"] or (row["in_flight"] and row["stall"] not in ("—", "ok")) else " "
+        mark = "*" if row["in_flight"] and row["stall"] not in ("—", "ok") else " "
         print(
             f"{mark} {row['kind']:<32} {row['state']:<10} {fmt_mib(row['bytes']):>10} "
             f"{fmt_secs(row['seconds']):>8} {fmt_rate(row['mib_s']):>10}  "
             f"{row['stall']:<10} {local_clock(row['updated'])}"
         )
+
+def print_wave(rows):
+    wave = last_wave(rows)
+    wave.sort(key=lambda row: row["updated"] or row["created"] or datetime.fromtimestamp(0, tz=timezone.utc), reverse=True)
+    if not wave:
+        print("\nWAVE   (none)")
+        return
+    started = min(row["created"] for row in wave if row.get("created"))
+    states = defaultdict(int)
+    total = 0
+    completed_bytes = 0
+    completed_secs = 0.0
+    rates = []
+    ends = []
+    for row in wave:
+        states[row["state"]] += 1
+        total += row["bytes"] or 0
+        if row["state"] == "completed" and row["seconds"]:
+            completed_secs += row["seconds"]
+            completed_bytes += row["bytes"] or 0
+            if row["mib_s"]:
+                rates.append(row["mib_s"])
+        if row.get("updated"):
+            ends.append(row["updated"])
+    rates.sort()
+    median = rates[len(rates) // 2] if rates else None
+    avg = (completed_bytes / MIB / completed_secs) if completed_secs else None
+    span = (max(ends) - started).total_seconds() if ends and started else None
+    counts = "   ".join(
+        f"{name} {states[name]}"
+        for name in ("completed", "cancelled", "failed", "rejected", "running")
+        if states.get(name)
+    )
+    inflight = sum(1 for row in wave if row["in_flight"])
+    if inflight:
+        counts = (counts + "   " if counts else "") + f"in flight {inflight}"
+    print(f"\nWAVE   {local_clock(started)}   {len(wave)} tasks   {fmt_mib(total)}   span {fmt_secs(span)}")
+    if counts:
+        print(f"       {counts}")
+    print(f"       completed median {fmt_rate(median)}   avg {fmt_rate(avg)}")
+    print()
+    print_rows(wave)
 
 def render(live, samples, show_all):
     tasks = fetch_tasks()
@@ -560,45 +622,10 @@ def render(live, samples, show_all):
     rows.sort(key=lambda row: row["updated"] or datetime.fromtimestamp(0, tz=timezone.utc), reverse=True)
 
     print_host(live)
-    print()
-    print(f"TASKS  {len(rows)} local")
-    by_kind = defaultdict(lambda: {"n": 0, "bytes": 0, "secs": 0.0, "rates": []})
-    for row in rows:
-        bucket = by_kind[row["kind"]]
-        bucket["n"] += 1
-        bucket["bytes"] += row["bytes"] or 0
-        if row["state"] == "completed" and row["seconds"]:
-            bucket["secs"] += row["seconds"]
-            if row["mib_s"]:
-                bucket["rates"].append(row["mib_s"])
-    for kind in sorted(by_kind):
-        bucket = by_kind[kind]
-        rates_list = sorted(bucket["rates"])
-        median = rates_list[len(rates_list) // 2] if rates_list else None
-        avg = (bucket["bytes"] / MIB / bucket["secs"]) if bucket["secs"] else None
-        print(
-            f"  {kind:<32} {bucket['n']:>4} tasks  {fmt_mib(bucket['bytes']):>10}  "
-            f"median {fmt_rate(median):>10}  avg {fmt_rate(avg):>10}"
-        )
-
-    in_flight = [row for row in rows if row["in_flight"]]
-    slow = [row for row in rows if row["slow"]]
-    print_table("IN FLIGHT", in_flight)
-    print_table("SLOW  (under half the median rate for that kind)", slow[:8])
+    print_wave(rows)
     if show_all:
-        print_table("ALL TASKS", rows)
-    else:
-        print_table("RECENT", rows[:15])
-    print()
-    print("  *  slow (under half the median rate for that kind) or currently stalling")
-    print("  STALL")
-    print("    —          fine, or not enough host samples to blame anything")
-    print("    unsampled  slow, but it finished before watch was sampling")
-    print("    disk       high iowait / disk busy while it ran")
-    print("    memory     free RAM got very low")
-    print("    cpu        CPU was pegged")
-    print("    network    slow, but disk/memory/CPU were fine (R2/S3/peer path)")
-    print("  Unsuccessful tasks: data/analytics/unsuccessful.md")
+        print(f"\nALL TASKS  {len(rows)}")
+        print_rows(rows)
     print()
 
 def take_live(prev):
