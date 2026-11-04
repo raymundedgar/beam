@@ -71,20 +71,43 @@ qualify_line() {
 recent_rows=$(echo "$tasks_json" | jq -r '
   [((.tasks // []) | sort_by(.updated_at) | reverse[])][0:5]
   | .[]
-  | [(.spec.kind // "-"), (.state // "-"), (.updated_at // "")]
+  | [
+      (.spec.kind // "-"),
+      (.state // "-"),
+      ((.result.bytes_processed // 0) | tostring),
+      (.result.started_at // ""),
+      (.result.completed_at // ""),
+      (.updated_at // "")
+    ]
   | @tsv
 ')
 if [ -z "$recent_rows" ]; then
   recent="  (none yet)"
 else
-  recent=$'KIND\tSTATE\tUPDATED'
-  while IFS=$'\t' read -r kind state updated; do
+  recent=$'KIND\tSTATE\tSIZE\tTIME\tRATE\tUPDATED'
+  while IFS=$'\t' read -r kind state bytes started completed updated; do
     [ -z "$kind" ] && continue
     local_ts="—"
     if [ -n "$updated" ]; then
       local_ts=$(TZ=Asia/Shanghai date -d "$updated" '+%-I:%M:%S %p' 2>/dev/null || echo "$updated")
     fi
-    recent+=$'\n'"$kind"$'\t'"$state"$'\t'"$local_ts"
+    size="—"
+    elapsed="—"
+    rate="—"
+    if [ -n "${bytes:-}" ] && [ "$bytes" != "0" ]; then
+      size=$(awk -v b="$bytes" 'BEGIN { printf "%.1f MiB", b/1048576 }')
+    fi
+    if [ -n "$started" ] && [ -n "$completed" ]; then
+      s=$(date -d "$started" +%s.%N 2>/dev/null || true)
+      e=$(date -d "$completed" +%s.%N 2>/dev/null || true)
+      if [ -n "${s:-}" ] && [ -n "${e:-}" ]; then
+        elapsed=$(awk -v s="$s" -v e="$e" 'BEGIN { d=e-s; if (d<0) d=0; printf "%.2fs", d }')
+        if [ -n "${bytes:-}" ] && [ "$bytes" != "0" ]; then
+          rate=$(awk -v b="$bytes" -v s="$s" -v e="$e" 'BEGIN { d=e-s; if (d<=0) d=0.001; printf "%.1f MiB/s", b/1048576/d }')
+        fi
+      fi
+    fi
+    recent+=$'\n'"$kind"$'\t'"$state"$'\t'"$size"$'\t'"$elapsed"$'\t'"$rate"$'\t'"$local_ts"
   done <<< "$recent_rows"
 fi
 

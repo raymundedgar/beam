@@ -97,7 +97,9 @@ func Classify(state, detail string) (string, string) {
 	switch strings.ToLower(state) {
 	case "cancelled":
 		return "batch_cancelled", overseer["batch_cancelled"]
-	case "failed", "rejected":
+	case "rejected":
+		return "worker_failed", "The worker refused admission (not enough advertised CPU/RAM/bandwidth/connections)."
+	case "failed":
 		return "worker_failed", overseer["worker_failed"]
 	default:
 		return state, "The task did not complete successfully."

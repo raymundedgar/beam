@@ -1,6 +1,7 @@
 package storagehttp
 
 import (
+	"crypto/tls"
 	"errors"
 	"net"
 	"net/http"
@@ -20,6 +21,8 @@ var (
 )
 
 // NewClient returns the HTTP client for storage URLs.
+// HTTP/2 is disabled so parallel PUTs to one R2 host each get their own TCP
+// connection instead of multiplexing on a single stream that can stall.
 func NewClient(timeout time.Duration) *http.Client {
 	return newClient(timeout, func(address netip.AddrPort) bool {
 		return contracts.PublicAddressAllowed(address.Addr())
@@ -41,7 +44,8 @@ func newClient(timeout time.Duration, allowed func(netip.AddrPort) bool) *http.C
 	transport := &http.Transport{
 		Proxy:                 nil,
 		DialContext:           dialer.DialContext,
-		ForceAttemptHTTP2:     true,
+		ForceAttemptHTTP2:     false,
+		TLSNextProto:          map[string]func(authority string, c *tls.Conn) http.RoundTripper{},
 		MaxIdleConns:          4096,
 		MaxIdleConnsPerHost:   256,
 		MaxConnsPerHost:       0,

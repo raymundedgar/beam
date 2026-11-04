@@ -26,6 +26,10 @@ func TestClassifyOverseerReasons(t *testing.T) {
 	if code != "progress_timeout" {
 		t.Fatalf("hyphenated: %s", code)
 	}
+	code, meaning = Classify("rejected", "insufficient resource capacity")
+	if code != "worker_failed" || !strings.Contains(meaning, "admission") {
+		t.Fatalf("rejected: %s %s", code, meaning)
+	}
 }
 
 func TestAlertUnsuccessfulPosts(t *testing.T) {

@@ -148,3 +148,13 @@ func TestNewClientPoolsManyIdleConnectionsPerHost(t *testing.T) {
 		t.Fatalf("storage client idle pool is too small: idle=%d per_host=%d", transport.MaxIdleConns, transport.MaxIdleConnsPerHost)
 	}
 }
+
+func TestNewClientDisablesHTTP2(t *testing.T) {
+	transport := NewClient(time.Second).Transport.(*http.Transport)
+	if transport.ForceAttemptHTTP2 {
+		t.Fatal("storage client still attempts HTTP/2")
+	}
+	if transport.TLSNextProto == nil {
+		t.Fatal("storage client leaves HTTP/2 ALPN enabled")
+	}
+}
