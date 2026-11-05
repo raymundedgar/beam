@@ -8,6 +8,8 @@
 #
 # BEAM_SCORES_WAIT   seconds to wait after a refused read when BeamCore sends no
 #                    Retry-After (default 300; doubles on each repeat, max 1h)
+# DATAIMPULSE_USER / DATAIMPULSE_PASS in .env send audit reads through
+# gw.dataimpulse.com. Leave the password empty to connect directly.
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -45,10 +47,49 @@ def parse_retry_after(value):
         moment = moment.replace(tzinfo=timezone.utc)
     return max(0, int((moment - datetime.now(timezone.utc)).total_seconds()))
 
+def dotenv(path=".env"):
+    found = {}
+    try:
+        with open(path, encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                found[key.strip()] = value.strip().strip('"').strip("'")
+    except OSError:
+        pass
+    return found
+
+def setting(key, found, default=""):
+    value = os.environ.get(key)
+    if value is not None and value.strip():
+        return value.strip()
+    return found.get(key, default).strip()
+
+def audit_opener():
+    found = dotenv()
+    user = setting("DATAIMPULSE_USER", found)
+    password = setting("DATAIMPULSE_PASS", found)
+    if not user or not password:
+        return urllib.request.build_opener(), False
+    host = setting("DATAIMPULSE_HOST", found, "gw.dataimpulse.com")
+    port = setting("DATAIMPULSE_PORT", found, "823")
+    proxy = "http://%s:%s@%s:%s" % (
+        urllib.parse.quote(user, safe=""),
+        urllib.parse.quote(password, safe=""),
+        host,
+        port,
+    )
+    handlers = [urllib.request.ProxyHandler({"http": proxy, "https": proxy})]
+    return urllib.request.build_opener(*handlers), True
+
+OPENER, USING_PROXY = audit_opener()
+
 def get_json(url):
     request = urllib.request.Request(url, headers=HEADERS)
     try:
-        with urllib.request.urlopen(request, timeout=15) as response:
+        with OPENER.open(request, timeout=30) as response:
             return json.loads(response.read().decode())
     except urllib.error.HTTPError as err:
         detail = err.read().decode(errors="replace")[:200]
@@ -206,6 +247,8 @@ def print_snapshot(snapshot, note):
     print(f"        leaderboard {num(data.get('emissionPrismTiebreakScore'), 3)}")
     if note:
         print(f"        {note}")
+    if USING_PROXY:
+        print("        audit via DataImpulse")
     print()
     changes = []
     for profile in profiles:
@@ -454,6 +497,8 @@ elif newest:
     print(f"        leaderboard {num(newest.get('leaderboard'), 3)}")
     if note:
         print(f"        {note}")
+    if USING_PROXY:
+        print("        audit via DataImpulse")
     print()
 elif note:
     print(f"PRISM   {note}")

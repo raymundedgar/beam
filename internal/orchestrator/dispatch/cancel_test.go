@@ -35,11 +35,15 @@ func TestBatchCancellationIsScopedAndRejectsLateDispatch(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := service.CancelBatches(context.Background(), []string{"cancelled-batch", "pending-batch"}); err != nil {
+	if err := service.CancelBatches(context.Background(), []string{"cancelled-batch", "pending-batch"}, "no_delivery_cut"); err != nil {
 		t.Fatal(err)
 	}
 	if len(control.cancelled) != 1 || control.cancelled[0] != "cancelled" {
 		t.Fatalf("cancelled wrong workloads: %v", control.cancelled)
+	}
+	stopped, _ := store.Get("cancelled/attempt")
+	if stopped.UpstreamError != "batch_cancelled: no_delivery_cut" {
+		t.Fatalf("cancel reason = %q", stopped.UpstreamError)
 	}
 	scheduled, _ := store.Get("scheduled/attempt")
 	if scheduled.State != StateRunning {

@@ -462,6 +462,7 @@ func (control *roomControl) handleTaskOfferBatchCancel(ctx context.Context, enco
 	}
 	var payload struct {
 		BatchIDs []string `json:"batch_ids"`
+		Reason   string   `json:"reason"`
 	}
 	if err := json.Unmarshal(encoded, &payload); err != nil {
 		return err
@@ -474,7 +475,7 @@ func (control *roomControl) handleTaskOfferBatchCancel(ctx context.Context, enco
 			return errors.New("invalid batch cancellation")
 		}
 	}
-	return control.tasks.CancelBatches(ctx, payload.BatchIDs)
+	return control.tasks.CancelBatches(ctx, payload.BatchIDs, payload.Reason)
 }
 
 func (control *roomControl) submitResult(ctx context.Context, result contracts.RoomTaskResult) error {

@@ -249,6 +249,7 @@ def enrich(task, medians):
         "created": parse_time(task.get("created_at")),
         "in_flight": state in IN_FLIGHT,
         "id": (task.get("external_id") or "")[:10],
+        "stop": stop_reason(task),
     }
 
 def medians_of(rows):
@@ -263,6 +264,21 @@ def medians_of(rows):
     return out
 
 UNSUCCESSFUL_PATH = "data/analytics/unsuccessful.md"
+
+# BeamCore's reason on task_offer_batch_cancel and failureReason.
+STOP_REASONS = (
+    ("deadline_expired", "The batch reached the deadline in its offer."),
+    ("progress_timeout", "A room lane stopped making progress."),
+    ("no_delivery_cut", "The batch had delivered nothing and was taken back before that deadline."),
+    ("tail_cut", "The batch was taken back before that deadline, late in the transfer."),
+    ("worker_failed", "The participant failed the work."),
+    ("storage_failed", "The participant reported a storage failure."),
+    ("path_failed", "The participant reported that a room path was refused."),
+    ("endpoint_failed", "A room endpoint failed."),
+    ("beam_side", "Beam failed."),
+    ("superseded", "Another attempt covered the work."),
+    ("transfer_ended", "The transfer ended first."),
+)
 
 def task_reason(task):
     result = task.get("result") if isinstance(task.get("result"), dict) else {}
@@ -279,6 +295,40 @@ def task_reason(task):
     if len(text) > 280:
         text = text[:277] + "..."
     return text.replace("|", "/")
+
+def stop_reason(task):
+    text = task_reason(task).lower()
+    for code, _ in STOP_REASONS:
+        if code in text:
+            return code
+    state = task.get("state") or ""
+    if state in ("completed",) or state in IN_FLIGHT:
+        return ""
+    result = task.get("result") if isinstance(task.get("result"), dict) else {}
+    delivered = 0
+    if isinstance(result, dict) and result.get("bytes_processed"):
+        delivered = int(result["bytes_processed"])
+    expires = parse_time(task.get("assignment_expires_at"))
+    updated = parse_time(task.get("updated_at"))
+    at_deadline = False
+    if expires is not None and updated is not None:
+        try:
+            at_deadline = updated >= expires - timedelta(seconds=2)
+        except OverflowError:
+            at_deadline = False
+    if "lease_expired" in text or at_deadline:
+        return "deadline_expired"
+    if any(token in text for token in ("http 500", "http 502", "http 503", "http 504", "serviceunavailable")):
+        return "storage_failed"
+    if "admission" in text or "worker rejected" in text:
+        return "worker_failed"
+    if state == "cancelled":
+        if delivered > 0:
+            return "tail_cut"
+        return "no_delivery_cut"
+    if state == "failed":
+        return "worker_failed"
+    return ""
 
 def write_unsuccessful(tasks):
     bad = [task for task in tasks if task.get("state") in ("failed", "cancelled", "rejected")]
@@ -297,16 +347,17 @@ def write_unsuccessful(tasks):
         lines.append("None right now.")
     else:
         lines += [
-            "| KIND | STATE | CREATED | UPDATED | REASON |",
-            "| --- | --- | --- | --- | --- |",
+            "| KIND | STATE | CREATED | UPDATED | STOP | REASON |",
+            "| --- | --- | --- | --- | --- | --- |",
         ]
         for task in sorted(bad, key=lambda item: item.get("updated_at") or "", reverse=True):
             lines.append(
-                "| {kind} | {state} | {created} | {updated} | {reason} |".format(
+                "| {kind} | {state} | {created} | {updated} | {stop} | {reason} |".format(
                     kind=kind_of(task),
                     state=task.get("state") or "-",
                     created=local_clock(parse_time(task.get("created_at"))),
                     updated=local_clock(parse_time(task.get("updated_at"))),
+                    stop=stop_reason(task) or "—",
                     reason=task_reason(task) or "-",
                 )
             )
@@ -340,13 +391,13 @@ def print_rows(rows):
     if not rows:
         print("  (none)")
         return
-    print(f"  {'KIND':<32} {'STATE':<10} {'SIZE':>10} {'TIME':>8} {'RATE':>10}  {'UPDATED'}")
-    print("  " + "-" * 86)
+    print(f"  {'KIND':<32} {'STATE':<10} {'SIZE':>10} {'TIME':>8} {'RATE':>10}  {'STOP':<18} {'UPDATED'}")
+    print("  " + "-" * 106)
     for row in rows:
         line = (
             f"  {row['kind']:<32} {row['state']:<10} {fmt_mib(row['bytes']):>10} "
             f"{fmt_secs(row['seconds']):>8} {fmt_rate(row['mib_s']):>10}  "
-            f"{local_clock(row['updated'])}"
+            f"{(row.get('stop') or '—'):<18} {local_clock(row['updated'])}"
         )
         if row["state"] != "completed" and not row["in_flight"]:
             line = emphasize(line)
@@ -480,6 +531,12 @@ def emission():
     save_emission(cached)
     return cached
 
+def print_stop_legend():
+    print("\nWHY WORK STOPPED")
+    for code, meaning in STOP_REASONS:
+        print(f"  {code:<20} {meaning}")
+    print()
+
 def print_emission(row):
     if not row or row.get("tao") is None:
         print(f"EMISSION  {row.get('error') or 'subnet 105 stake unavailable'}")
@@ -502,6 +559,7 @@ def render(show_all):
 
     print_emission(emission())
     print_wave(rows)
+    print_stop_legend()
     if show_all:
         print(f"\nALL TASKS  {len(rows)}")
         print_rows(rows)

@@ -146,7 +146,7 @@ func (s *Service) Dispatch(ctx context.Context, request DispatchRequest) (Record
 		now := s.config.Now().UTC()
 		record = Record{Source: request.Source, ExternalID: request.ExternalID, WorkloadKey: key, BatchID: request.BatchID,
 			TransferID: request.TransferID,
-			State: StateReceived, Spec: request.Spec, CreatedAt: now, UpdatedAt: now}
+			State:      StateReceived, Spec: request.Spec, CreatedAt: now, UpdatedAt: now}
 		if err := s.save(record, "external task received"); err != nil {
 			return Record{}, err
 		}
@@ -358,7 +358,7 @@ func (s *Service) BatchCancelled(batchID string) bool {
 	return cancelledUntil.After(s.config.Now())
 }
 
-func (s *Service) CancelBatches(ctx context.Context, batchIDs []string) error {
+func (s *Service) CancelBatches(ctx context.Context, batchIDs []string, reason string) error {
 	now := s.config.Now()
 	cancelled := make(map[string]struct{}, len(batchIDs))
 	s.mu.Lock()
@@ -383,7 +383,11 @@ func (s *Service) CancelBatches(ctx context.Context, batchIDs []string) error {
 		if _, ok := cancelled[record.BatchID]; !ok {
 			continue
 		}
-		if err := s.CancelWorkload(ctx, record.WorkloadKey, "batch_cancelled"); err != nil {
+		message := "batch_cancelled"
+		if reason != "" {
+			message = "batch_cancelled: " + reason
+		}
+		if err := s.CancelWorkload(ctx, record.WorkloadKey, message); err != nil {
 			failures = append(failures, err)
 		}
 	}
