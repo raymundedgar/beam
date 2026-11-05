@@ -72,6 +72,76 @@ func TestPresignedPartRetriesDestination500ThenCompletes(t *testing.T) {
 	}
 }
 
+func TestPresignedPartResumesWithIfRange(t *testing.T) {
+	object := []byte("0123456789abcdef")
+	var hits atomic.Int32
+	source := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if hits.Add(1) == 1 {
+			w.Header().Set("ETag", `"abc"`)
+			_, _ = w.Write(object[:4])
+			return
+		}
+		if got := r.Header.Get("If-Range"); got != `"abc"` {
+			t.Errorf("If-Range = %q", got)
+		}
+		if got := r.Header.Get("Range"); got != "bytes=4-15" {
+			t.Errorf("Range = %q", got)
+		}
+		w.Header().Set("ETag", `"abc"`)
+		w.Header().Set("Content-Range", "bytes 4-15/16")
+		w.WriteHeader(http.StatusPartialContent)
+		_, _ = w.Write(object[4:])
+	}))
+	t.Cleanup(source.Close)
+	dest := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		if string(body) != string(object) {
+			t.Errorf("destination body = %q", body)
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(dest.Close)
+
+	result, err := retryingHandler().Execute(context.Background(), presignedSpec(t, source.URL, dest.URL, int64(len(object))))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.BytesProcessed != int64(len(object)) || hits.Load() != 2 {
+		t.Fatalf("bytes=%d sourceHits=%d", result.BytesProcessed, hits.Load())
+	}
+}
+
+func TestPresignedPartRestartsWhenIfRangeMisses(t *testing.T) {
+	object := []byte("0123456789abcdef")
+	var hits atomic.Int32
+	source := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if hits.Add(1) == 1 {
+			w.Header().Set("ETag", `"abc"`)
+			_, _ = w.Write(object[:4])
+			return
+		}
+		w.Header().Set("ETag", `"def"`)
+		_, _ = w.Write(object)
+	}))
+	t.Cleanup(source.Close)
+	dest := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		if string(body) != string(object) {
+			t.Errorf("destination body = %q", body)
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(dest.Close)
+
+	result, err := retryingHandler().Execute(context.Background(), presignedSpec(t, source.URL, dest.URL, int64(len(object))))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.BytesProcessed != int64(len(object)) {
+		t.Fatalf("bytes=%d", result.BytesProcessed)
+	}
+}
+
 func TestPresignedPartDoesNotRetryHTTP403(t *testing.T) {
 	source := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusForbidden)

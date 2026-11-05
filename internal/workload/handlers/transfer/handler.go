@@ -1,6 +1,7 @@
 package transfer
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -26,6 +27,10 @@ const defaultResponseBodyLimit = 64 << 10
 const multipartCheckpointSchema = "beam.transfer.multipart/1"
 const presignedRetryAttempts = 4
 const presignedRetryBackoff = 250 * time.Millisecond
+
+// maxResumablePart is the largest presigned object this worker buffers so a
+// broken GET can resume with Range and If-Range instead of starting over.
+const maxResumablePart = 64 << 20
 
 type multipartCheckpoint struct {
 	Parts map[string]partCheckpoint `json:"parts"`
@@ -187,6 +192,9 @@ func (h *Handler) executePart(ctx context.Context, part contracts.TransferPart) 
 	if part.Authenticated() {
 		return h.executeAuthenticatedPart(ctx, part)
 	}
+	if part.Length > 0 && part.Length <= maxResumablePart {
+		return h.executeResumablePresigned(ctx, part)
+	}
 	var last partResult
 	var lastErr error
 	for attempt := 1; attempt <= presignedRetryAttempts; attempt++ {
@@ -209,6 +217,135 @@ func (h *Handler) executePart(ctx context.Context, part contracts.TransferPart) 
 		}
 	}
 	return last, lastErr
+}
+
+func (h *Handler) executeResumablePresigned(ctx context.Context, part contracts.TransferPart) (partResult, error) {
+	body, err := h.readSource(ctx, part)
+	if err != nil {
+		return partResult{bytes: int64(len(body))}, err
+	}
+	return h.putPresigned(ctx, part, body)
+}
+
+func (h *Handler) readSource(ctx context.Context, part contracts.TransferPart) ([]byte, error) {
+	buf := make([]byte, 0, part.Length)
+	var etag string
+	var lastErr error
+	for attempt := 1; attempt <= presignedRetryAttempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			if lastErr != nil {
+				return buf, lastErr
+			}
+			return buf, err
+		}
+		resume := int64(len(buf))
+		match := etag
+		if resume > 0 && match == "" {
+			buf = buf[:0]
+			resume = 0
+		}
+		response, err := h.openSourceFrom(ctx, part, resume, match)
+		if err != nil {
+			lastErr = err
+			if !transientTransferError(err) || attempt == presignedRetryAttempts {
+				return buf, err
+			}
+			if err := h.backoff(ctx, attempt); err != nil {
+				return buf, lastErr
+			}
+			continue
+		}
+		if resume > 0 && response.StatusCode == http.StatusOK {
+			buf = buf[:0]
+		}
+		if tag := strongETag(response.Header.Get("ETag")); tag != "" {
+			etag = tag
+		}
+		need := int(part.Length - int64(len(buf)))
+		chunk := make([]byte, need)
+		n, readErr := io.ReadFull(response.Body, chunk)
+		_ = response.Body.Close()
+		if n > 0 {
+			buf = append(buf, chunk[:n]...)
+		}
+		if int64(len(buf)) == part.Length {
+			return buf, nil
+		}
+		if readErr == nil || readErr == io.EOF {
+			readErr = io.ErrUnexpectedEOF
+		}
+		lastErr = fmt.Errorf("fetch source: %w", readErr)
+		if !transientTransferError(readErr) || attempt == presignedRetryAttempts {
+			return buf, lastErr
+		}
+		if err := h.backoff(ctx, attempt); err != nil {
+			return buf, lastErr
+		}
+	}
+	return buf, lastErr
+}
+
+func (h *Handler) putPresigned(ctx context.Context, part contracts.TransferPart, body []byte) (partResult, error) {
+	sum := sha256.Sum256(body)
+	digest := hex.EncodeToString(sum[:])
+	if part.ExpectedSHA256 != "" && !strings.EqualFold(digest, part.ExpectedSHA256) {
+		return partResult{bytes: int64(len(body)), sha256: digest}, fmt.Errorf("SHA-256 mismatch: got %s", digest)
+	}
+	var last partResult
+	var lastErr error
+	for attempt := 1; attempt <= presignedRetryAttempts; attempt++ {
+		if err := ctx.Err(); err != nil {
+			if lastErr != nil {
+				return last, lastErr
+			}
+			return partResult{}, err
+		}
+		last, lastErr = h.putPresignedOnce(ctx, part, body, digest)
+		if lastErr == nil || !transientTransferError(lastErr) || attempt == presignedRetryAttempts {
+			return last, lastErr
+		}
+		if err := h.backoff(ctx, attempt); err != nil {
+			return last, lastErr
+		}
+	}
+	return last, lastErr
+}
+
+func (h *Handler) putPresignedOnce(ctx context.Context, part contracts.TransferPart, body []byte, digest string) (partResult, error) {
+	destinationMethod := strings.ToUpper(strings.TrimSpace(part.Destination.Method))
+	if destinationMethod == "" {
+		destinationMethod = http.MethodPut
+	}
+	destinationRequest, err := http.NewRequestWithContext(ctx, destinationMethod, part.Destination.URL, bytes.NewReader(body))
+	if err != nil {
+		return partResult{}, fmt.Errorf("create destination request: %w", err)
+	}
+	copyHeaders(destinationRequest.Header, part.Destination.Headers)
+	if destinationRequest.Header.Get("Content-Type") == "" {
+		destinationRequest.Header.Set("Content-Type", "application/octet-stream")
+	}
+	destinationRequest.ContentLength = int64(len(body))
+	destinationResponse, err := h.client.Do(destinationRequest)
+	if err != nil {
+		return partResult{bytes: int64(len(body))}, fmt.Errorf("write destination: %w", err)
+	}
+	defer destinationResponse.Body.Close()
+	_, _ = io.Copy(io.Discard, io.LimitReader(destinationResponse.Body, defaultResponseBodyLimit))
+	if destinationResponse.StatusCode < 200 || destinationResponse.StatusCode >= 300 {
+		return partResult{bytes: int64(len(body))}, &httpStatusError{label: "destination", code: destinationResponse.StatusCode}
+	}
+	return partResult{
+		bytes: int64(len(body)), sha256: digest,
+		etag: strings.Trim(destinationResponse.Header.Get("ETag"), `"`),
+	}, nil
+}
+
+func (h *Handler) backoff(ctx context.Context, attempt int) error {
+	delay := time.Duration(attempt) * presignedRetryBackoff
+	if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) <= delay {
+		return context.DeadlineExceeded
+	}
+	return h.wait(ctx, delay)
 }
 
 func (h *Handler) executePresignedPart(ctx context.Context, part contracts.TransferPart) (partResult, error) {
@@ -265,13 +402,23 @@ func (h *Handler) executePresignedPart(ctx context.Context, part contracts.Trans
 
 // openSource returns a successful source response; the caller closes its body.
 func (h *Handler) openSource(ctx context.Context, part contracts.TransferPart) (*http.Response, error) {
+	return h.openSourceFrom(ctx, part, 0, "")
+}
+
+// openSourceFrom reads part, or the unread tail when resume is past the start.
+// A strong etag sends If-Range so a changed object comes back as a full 200
+// instead of a 206 that would append bytes from a different version.
+func (h *Handler) openSourceFrom(ctx context.Context, part contracts.TransferPart, resume int64, etag string) (*http.Response, error) {
 	sourceRequest, err := http.NewRequestWithContext(ctx, http.MethodGet, part.Source.URL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("create source request: %w", err)
 	}
 	copyHeaders(sourceRequest.Header, part.Source.Headers)
-	if part.SourceRange && part.Length > 0 {
-		sourceRequest.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", part.Offset, part.Offset+part.Length-1))
+	if spec, ok := sourceRangeHeader(part, resume); ok {
+		sourceRequest.Header.Set("Range", spec)
+	}
+	if resume > 0 && etag != "" {
+		sourceRequest.Header.Set("If-Range", etag)
 	}
 	sourceResponse, err := h.client.Do(sourceRequest)
 	if err != nil {
@@ -281,11 +428,64 @@ func (h *Handler) openSource(ctx context.Context, part contracts.TransferPart) (
 		defer sourceResponse.Body.Close()
 		return nil, responseError("source", sourceResponse)
 	}
-	if part.SourceRange && part.Length > 0 && sourceResponse.StatusCode != http.StatusPartialContent {
+	if resume == 0 && part.SourceRange && part.Length > 0 && sourceResponse.StatusCode != http.StatusPartialContent {
 		_ = sourceResponse.Body.Close()
 		return nil, fmt.Errorf("source ignored required byte range: HTTP %d", sourceResponse.StatusCode)
 	}
+	if resume > 0 && sourceResponse.StatusCode == http.StatusPartialContent {
+		if start, ok := contentRangeStart(sourceResponse.Header.Get("Content-Range")); ok && start != rangeStart(part, resume) {
+			_ = sourceResponse.Body.Close()
+			return nil, fmt.Errorf("source resumed at byte %d, want %d", start, rangeStart(part, resume))
+		}
+	}
 	return sourceResponse, nil
+}
+
+func sourceRangeHeader(part contracts.TransferPart, resume int64) (string, bool) {
+	if resume < 0 {
+		resume = 0
+	}
+	if part.SourceRange && part.Length > 0 {
+		start := part.Offset + resume
+		end := part.Offset + part.Length - 1
+		if start > end {
+			return "", false
+		}
+		return fmt.Sprintf("bytes=%d-%d", start, end), true
+	}
+	if resume > 0 && part.Length > 0 && resume < part.Length {
+		return fmt.Sprintf("bytes=%d-%d", resume, part.Length-1), true
+	}
+	return "", false
+}
+
+func rangeStart(part contracts.TransferPart, resume int64) int64 {
+	if part.SourceRange {
+		return part.Offset + resume
+	}
+	return resume
+}
+
+func strongETag(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" || strings.HasPrefix(value, "W/") {
+		return ""
+	}
+	return value
+}
+
+func contentRangeStart(value string) (int64, bool) {
+	value = strings.TrimSpace(value)
+	value = strings.TrimPrefix(value, "bytes ")
+	dash := strings.IndexByte(value, '-')
+	if dash <= 0 {
+		return 0, false
+	}
+	start, err := strconv.ParseInt(value[:dash], 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return start, true
 }
 
 func validateEndpoint(label string, endpoint contracts.HTTPEndpoint) error {

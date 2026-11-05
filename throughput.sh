@@ -557,6 +557,11 @@ def last_wave(rows):
     wave.reverse()
     return wave
 
+def emphasize(text):
+    if not sys.stdout.isatty():
+        return text
+    return f"\033[1;31m{text}\033[0m"
+
 def print_rows(rows):
     if not rows:
         print("  (none)")
@@ -565,11 +570,14 @@ def print_rows(rows):
     print("  " + "-" * 98)
     for row in rows:
         mark = "*" if row["in_flight"] and row["stall"] not in ("—", "ok") else " "
-        print(
+        line = (
             f"{mark} {row['kind']:<32} {row['state']:<10} {fmt_mib(row['bytes']):>10} "
             f"{fmt_secs(row['seconds']):>8} {fmt_rate(row['mib_s']):>10}  "
             f"{row['stall']:<10} {local_clock(row['updated'])}"
         )
+        if row["state"] != "completed" and not row["in_flight"]:
+            line = emphasize(line)
+        print(line)
 
 def print_wave(rows):
     wave = last_wave(rows)
