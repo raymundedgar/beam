@@ -80,3 +80,5 @@ wallets/
 #scripts
 scripts/
 /.tmp
+
+*.zip
