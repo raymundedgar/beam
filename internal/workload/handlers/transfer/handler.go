@@ -25,12 +25,14 @@ import (
 
 const defaultResponseBodyLimit = 64 << 10
 const multipartCheckpointSchema = "beam.transfer.multipart/1"
-const presignedRetryAttempts = 4
-const presignedRetryBackoff = 250 * time.Millisecond
 
 // maxResumablePart is the largest presigned object this worker buffers so a
 // broken GET can resume with Range and If-Range instead of starting over.
 const maxResumablePart = 64 << 20
+
+// presignedAttempts is the number of tries for one presigned part, shared with
+// the upstream retry budget.
+const presignedAttempts = 3
 
 type multipartCheckpoint struct {
 	Parts map[string]partCheckpoint `json:"parts"`
@@ -48,7 +50,7 @@ type partCheckpoint struct {
 
 type Handler struct {
 	client *http.Client
-	// wait pauses between authenticated upload attempts.
+	// wait pauses between upload attempts.
 	wait func(context.Context, time.Duration) error
 }
 
@@ -197,7 +199,7 @@ func (h *Handler) executePart(ctx context.Context, part contracts.TransferPart) 
 	}
 	var last partResult
 	var lastErr error
-	for attempt := 1; attempt <= presignedRetryAttempts; attempt++ {
+	for attempt := 1; attempt <= presignedAttempts; attempt++ {
 		if err := ctx.Err(); err != nil {
 			if lastErr != nil {
 				return last, lastErr
@@ -205,10 +207,10 @@ func (h *Handler) executePart(ctx context.Context, part contracts.TransferPart) 
 			return partResult{}, err
 		}
 		last, lastErr = h.executePresignedPart(ctx, part)
-		if lastErr == nil || !transientTransferError(lastErr) || attempt == presignedRetryAttempts {
+		if lastErr == nil || !transientTransferError(lastErr) || attempt == presignedAttempts {
 			return last, lastErr
 		}
-		delay := time.Duration(attempt) * presignedRetryBackoff
+		delay := time.Duration(attempt) * uploadRetryBackoff
 		if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) <= delay {
 			return last, lastErr
 		}
@@ -231,7 +233,7 @@ func (h *Handler) readSource(ctx context.Context, part contracts.TransferPart) (
 	buf := make([]byte, 0, part.Length)
 	var etag string
 	var lastErr error
-	for attempt := 1; attempt <= presignedRetryAttempts; attempt++ {
+	for attempt := 1; attempt <= presignedAttempts; attempt++ {
 		if err := ctx.Err(); err != nil {
 			if lastErr != nil {
 				return buf, lastErr
@@ -247,7 +249,7 @@ func (h *Handler) readSource(ctx context.Context, part contracts.TransferPart) (
 		response, err := h.openSourceFrom(ctx, part, resume, match)
 		if err != nil {
 			lastErr = err
-			if !transientTransferError(err) || attempt == presignedRetryAttempts {
+			if !transientTransferError(err) || attempt == presignedAttempts {
 				return buf, err
 			}
 			if err := h.backoff(ctx, attempt); err != nil {
@@ -275,7 +277,7 @@ func (h *Handler) readSource(ctx context.Context, part contracts.TransferPart) (
 			readErr = io.ErrUnexpectedEOF
 		}
 		lastErr = fmt.Errorf("fetch source: %w", readErr)
-		if !transientTransferError(readErr) || attempt == presignedRetryAttempts {
+		if !transientTransferError(readErr) || attempt == presignedAttempts {
 			return buf, lastErr
 		}
 		if err := h.backoff(ctx, attempt); err != nil {
@@ -293,7 +295,7 @@ func (h *Handler) putPresigned(ctx context.Context, part contracts.TransferPart,
 	}
 	var last partResult
 	var lastErr error
-	for attempt := 1; attempt <= presignedRetryAttempts; attempt++ {
+	for attempt := 1; attempt <= presignedAttempts; attempt++ {
 		if err := ctx.Err(); err != nil {
 			if lastErr != nil {
 				return last, lastErr
@@ -301,7 +303,7 @@ func (h *Handler) putPresigned(ctx context.Context, part contracts.TransferPart,
 			return partResult{}, err
 		}
 		last, lastErr = h.putPresignedOnce(ctx, part, body, digest)
-		if lastErr == nil || !transientTransferError(lastErr) || attempt == presignedRetryAttempts {
+		if lastErr == nil || !transientTransferError(lastErr) || attempt == presignedAttempts {
 			return last, lastErr
 		}
 		if err := h.backoff(ctx, attempt); err != nil {
@@ -332,7 +334,7 @@ func (h *Handler) putPresignedOnce(ctx context.Context, part contracts.TransferP
 	defer destinationResponse.Body.Close()
 	_, _ = io.Copy(io.Discard, io.LimitReader(destinationResponse.Body, defaultResponseBodyLimit))
 	if destinationResponse.StatusCode < 200 || destinationResponse.StatusCode >= 300 {
-		return partResult{bytes: int64(len(body))}, &httpStatusError{label: "destination", code: destinationResponse.StatusCode}
+		return partResult{bytes: int64(len(body))}, &statusError{label: "destination", status: destinationResponse.StatusCode}
 	}
 	return partResult{
 		bytes: int64(len(body)), sha256: digest,
@@ -341,7 +343,7 @@ func (h *Handler) putPresignedOnce(ctx context.Context, part contracts.TransferP
 }
 
 func (h *Handler) backoff(ctx context.Context, attempt int) error {
-	delay := time.Duration(attempt) * presignedRetryBackoff
+	delay := time.Duration(attempt) * uploadRetryBackoff
 	if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) <= delay {
 		return context.DeadlineExceeded
 	}
@@ -385,7 +387,7 @@ func (h *Handler) executePresignedPart(ctx context.Context, part contracts.Trans
 	defer destinationResponse.Body.Close()
 	_, _ = io.Copy(io.Discard, io.LimitReader(destinationResponse.Body, defaultResponseBodyLimit))
 	if destinationResponse.StatusCode < 200 || destinationResponse.StatusCode >= 300 {
-		return partResult{bytes: counter.count}, &httpStatusError{label: "destination", code: destinationResponse.StatusCode}
+		return partResult{bytes: counter.count}, &statusError{label: "destination", status: destinationResponse.StatusCode}
 	}
 	if part.Length > 0 && counter.count != part.Length {
 		return partResult{bytes: counter.count}, fmt.Errorf("source returned %d bytes, expected %d", counter.count, part.Length)
@@ -498,31 +500,31 @@ func validateEndpoint(label string, endpoint contracts.HTTPEndpoint) error {
 
 func responseError(label string, response *http.Response) error {
 	body, _ := io.ReadAll(io.LimitReader(response.Body, defaultResponseBodyLimit))
-	return &httpStatusError{label: label, code: response.StatusCode, body: strings.TrimSpace(string(body))}
+	return &statusError{label: label, status: response.StatusCode, message: strings.TrimSpace(string(body))}
 }
 
-type httpStatusError struct {
-	label string
-	code  int
-	body  string
+type statusError struct {
+	label   string
+	status  int
+	message string
 }
 
-func (e *httpStatusError) Error() string {
-	if e.body == "" {
-		return fmt.Sprintf("%s returned HTTP %d", e.label, e.code)
+func (e *statusError) Error() string {
+	if e.message == "" {
+		return fmt.Sprintf("%s returned HTTP %d", e.label, e.status)
 	}
-	return fmt.Sprintf("%s returned HTTP %d: %s", e.label, e.code, e.body)
+	return fmt.Sprintf("%s returned HTTP %d: %s", e.label, e.status, e.message)
 }
 
-func (e *httpStatusError) transient() bool {
-	return e.code == http.StatusRequestTimeout || e.code == http.StatusTooManyRequests || e.code >= 500
+func (e *statusError) transient() bool {
+	return e.status == http.StatusRequestTimeout || e.status == http.StatusTooManyRequests || e.status >= 500
 }
 
 func transientTransferError(err error) bool {
 	if err == nil || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return false
 	}
-	var status *httpStatusError
+	var status *statusError
 	if errors.As(err, &status) {
 		return status.transient()
 	}
