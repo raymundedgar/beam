@@ -166,6 +166,54 @@ func TestTransferSlotsSerializeUploads(t *testing.T) {
 	}
 }
 
+func TestUploadSlotsSerializePuts(t *testing.T) {
+	const length = 8
+	hold := make(chan struct{})
+	var closeHold sync.Once
+	release := func() { closeHold.Do(func() { close(hold) }) }
+	t.Cleanup(release)
+	var inside atomic.Int32
+	var peak atomic.Int32
+	source := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("01234567"))
+	}))
+	t.Cleanup(source.Close)
+	dest := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := inside.Add(1)
+		for {
+			old := peak.Load()
+			if n <= old || peak.CompareAndSwap(old, n) {
+				break
+			}
+		}
+		<-hold
+		inside.Add(-1)
+		_, _ = io.Copy(io.Discard, r.Body)
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(dest.Close)
+	handler := retryingHandler()
+	handler.slots = nil
+	handler.uploads = make(chan struct{}, 1)
+	spec := domain.Spec{
+		Kind: domain.KindTransferMultipart, Payload: twoPartPayload(t, source.URL, dest.URL, length),
+		Resources: domain.Resources{MemoryBytes: 2 * bufferedBytes(length)},
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := handler.Execute(context.Background(), spec)
+		done <- err
+	}()
+	time.Sleep(80 * time.Millisecond)
+	if peak.Load() != 1 {
+		t.Fatalf("peak=%d", peak.Load())
+	}
+	release()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestActiveTransferCount(t *testing.T) {
 	base := activeTransfers.Load()
 	if got := enterTransfer(); got != base+1 {

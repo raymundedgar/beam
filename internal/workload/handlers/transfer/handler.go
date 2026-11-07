@@ -12,7 +12,6 @@ import (
 	"log"
 	"net"
 	"net/http"
-	"net/http/httptrace"
 	"net/url"
 	"os"
 	"strconv"
@@ -54,9 +53,14 @@ type partCheckpoint struct {
 }
 
 // defaultTransferSlots is how many presigned transfers may move bytes at once.
-// A wave can be nine offers. The offer clock runs while a task waits for a
-// slot, and Beam cancels whatever has not finished at about 11 seconds.
-const defaultTransferSlots = 12
+// A wave can be sixteen offers. The offer clock runs while a task waits for a
+// slot, and Beam cancels a late offer that has not finished in about 10 seconds.
+const defaultTransferSlots = 16
+
+// defaultUploadSlots is how many of those transfers may upload at once.
+// Sixteen uploads together left some connections near 3 MiB/s. The same object
+// on a quiet connection finished in about 2 seconds.
+const defaultUploadSlots = 6
 
 type Handler struct {
 	client *http.Client
@@ -66,13 +70,15 @@ type Handler struct {
 	logf func(string, ...any)
 	// slots limits transfers that are reading or writing. Nil means no limit.
 	slots chan struct{}
+	// uploads limits PUTs. Nil means no separate upload limit.
+	uploads chan struct{}
 }
 
 func NewHandler(client *http.Client) *Handler {
 	if client == nil {
 		client = storagehttp.NewClient(30 * time.Minute)
 	}
-	return &Handler{client: client, wait: sleepContext, logf: log.Printf, slots: transferSlots()}
+	return &Handler{client: client, wait: sleepContext, logf: log.Printf, slots: transferSlots(), uploads: uploadSlots()}
 }
 
 func transferSlots() chan struct{} {
@@ -109,6 +115,42 @@ func (h *Handler) releaseSlot() {
 		return
 	}
 	<-h.slots
+}
+
+func uploadSlots() chan struct{} {
+	n := defaultUploadSlots
+	if raw := os.Getenv("BEAM_WORKER_UPLOAD_CONCURRENCY"); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err == nil {
+			n = parsed
+		}
+	}
+	if n == 0 {
+		n = defaultUploadSlots
+	}
+	if n < 0 {
+		return nil
+	}
+	return make(chan struct{}, n)
+}
+
+func (h *Handler) acquireUpload(ctx context.Context) error {
+	if h.uploads == nil {
+		return nil
+	}
+	select {
+	case h.uploads <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (h *Handler) releaseUpload() {
+	if h.uploads == nil {
+		return
+	}
+	<-h.uploads
 }
 
 func (h *Handler) Kind() domain.Kind { return domain.KindTransferMultipart }
@@ -432,12 +474,14 @@ func (h *Handler) putPresigned(ctx context.Context, part contracts.TransferPart,
 	if part.ExpectedSHA256 != "" && !strings.EqualFold(digest, part.ExpectedSHA256) {
 		return partResult{bytes: int64(len(body)), sha256: digest}, fmt.Errorf("SHA-256 mismatch: got %s", digest)
 	}
-	attempt := 0
+	// The body is already in memory. Waiting here, instead of starting every
+	// PUT in the wave, keeps each upload on a connection that can finish.
+	if err := h.acquireUpload(ctx); err != nil {
+		return partResult{bytes: int64(len(body))}, err
+	}
+	defer h.releaseUpload()
 	return h.retryPresigned(ctx, func() (partResult, error) {
-		attempt++
-		// The last try is not abandoned for slowness. Cancelling every slow
-		// upload would retry until Beam cancels the offer.
-		return h.putPresignedOnce(ctx, part, body, digest, attempt < presignedAttempts)
+		return h.putPresignedOnce(ctx, part, body, digest)
 	})
 }
 
@@ -479,31 +523,18 @@ func (h *Handler) retryPresigned(ctx context.Context, attemptFn func() (partResu
 	}
 }
 
-func (h *Handler) putPresignedOnce(ctx context.Context, part contracts.TransferPart, body []byte, digest string, allowAbort bool) (partResult, error) {
+func (h *Handler) putPresignedOnce(ctx context.Context, part contracts.TransferPart, body []byte, digest string) (partResult, error) {
 	destinationMethod := strings.ToUpper(strings.TrimSpace(part.Destination.Method))
 	if destinationMethod == "" {
 		destinationMethod = http.MethodPut
 	}
 	started := time.Now()
 	counter := &byteCounter{r: bytes.NewReader(body), onFirst: func() { traceFrom(ctx).moved(part.Index, "destination") }}
-	// Close this attempt only when TCP acknowledgements stop. A 1.5s rate
-	// check cancelled uploads that had already handed over 20 MiB and were
-	// still accepted by the peer; those tasks then died at Beam's deadline.
-	attemptCtx, cancel := context.WithCancelCause(ctx)
-	defer cancel(nil)
-	connReady := make(chan net.Conn, 1)
-	attemptCtx = httptrace.WithClientTrace(attemptCtx, &httptrace.ClientTrace{
-		GotConn: func(info httptrace.GotConnInfo) {
-			select {
-			case connReady <- info.Conn:
-			default:
-			}
-		},
-	})
-	if allowAbort && int64(len(body)) >= hedgeMinBytes {
-		go watchAck(attemptCtx, cancel, connReady, int64(len(body)), 2*time.Second, 2*time.Second)
-	}
-	destinationRequest, err := http.NewRequestWithContext(attemptCtx, destinationMethod, part.Destination.URL, counter)
+	// Do not abandon a PUT because acknowledgements pause. In the 21:43 wave
+	// that closed uploads which had already handed over 17–31 MiB, and the
+	// replacement then took 16 seconds. The offer context still ends the
+	// upload when Beam cancels the task.
+	destinationRequest, err := http.NewRequestWithContext(ctx, destinationMethod, part.Destination.URL, counter)
 	if err != nil {
 		return partResult{}, fmt.Errorf("create destination request: %w", err)
 	}
@@ -521,9 +552,6 @@ func (h *Handler) putPresignedOnce(ctx context.Context, part contracts.TransferP
 	if err != nil {
 		if ctx.Err() != nil {
 			return partResult{bytes: int64(len(body))}, ctx.Err()
-		}
-		if context.Cause(attemptCtx) == errStalled {
-			return partResult{bytes: counter.n.Load()}, errStalled
 		}
 		return partResult{bytes: int64(len(body))}, fmt.Errorf("write destination: %w", err)
 	}
