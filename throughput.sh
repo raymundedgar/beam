@@ -395,15 +395,15 @@ def print_rows(rows):
         return
     print(
         f"  {'KIND':<32} {'STATE':<10} {'SIZE':>10} {'TIME':>8} {'RATE':>10}  "
-        f"{'STOP':<18} {'START':<12} {'END':<12} {'UPDATED'}"
+        f"{'STOP':<18} {'START':<12} {'END'}"
     )
-    print("  " + "-" * 130)
+    print("  " + "-" * 116)
     for row in rows:
         line = (
             f"  {row['kind']:<32} {row['state']:<10} {fmt_mib(row['bytes']):>10} "
             f"{fmt_secs(row['seconds']):>8} {fmt_rate(row['mib_s']):>10}  "
             f"{(row.get('stop') or '—'):<18} {local_clock(row.get('started')):<12} "
-            f"{local_clock(row.get('ended')):<12} {local_clock(row['updated'])}"
+            f"{local_clock(row.get('ended'))}"
         )
         if row["state"] != "completed" and not row["in_flight"]:
             line = emphasize(line)
@@ -414,7 +414,7 @@ def print_wave(rows):
     wave.sort(key=lambda row: row["updated"] or row["created"] or datetime.fromtimestamp(0, tz=timezone.utc), reverse=True)
     if not wave:
         print("\nWAVE   (none)")
-        return
+        return []
     started = min(row["created"] for row in wave if row.get("created"))
     states = defaultdict(int)
     total = 0
@@ -450,6 +450,7 @@ def print_wave(rows):
     print(f"       completed median {fmt_rate(median)}   avg {fmt_rate(avg)}")
     print()
     print_rows(wave)
+    return wave
 
 def read_hotkey():
     try:
@@ -537,9 +538,13 @@ def emission():
     save_emission(cached)
     return cached
 
-def print_stop_legend():
+def print_stop_legend(rows):
+    seen = {row.get("stop") for row in rows if row.get("stop")}
+    lines = [(code, meaning) for code, meaning in STOP_REASONS if code in seen]
+    if not lines:
+        return
     print("\nWHY WORK STOPPED")
-    for code, meaning in STOP_REASONS:
+    for code, meaning in lines:
         print(f"  {code:<20} {meaning}")
     print()
 
@@ -564,8 +569,7 @@ def render(show_all):
     rows.sort(key=lambda row: row["updated"] or datetime.fromtimestamp(0, tz=timezone.utc), reverse=True)
 
     print_emission(emission())
-    print_wave(rows)
-    print_stop_legend()
+    print_stop_legend(print_wave(rows))
     if show_all:
         print(f"\nALL TASKS  {len(rows)}")
         print_rows(rows)
