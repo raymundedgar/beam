@@ -12,7 +12,9 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -51,19 +53,65 @@ type partCheckpoint struct {
 	ProviderPartID string `json:"provider_part_id,omitempty"`
 }
 
+// defaultTransferSlots is how many presigned transfers may move bytes at once.
+// A wave is about eight offers, and the offer clock runs while a task waits
+// for a slot. Three slots left the later offers cancelled before they opened
+// a connection. Slow copies in those waves were one bad connection at about
+// 2 MiB/s, including while a single transfer was active, so the slot count
+// was not the speed limit.
+const defaultTransferSlots = 8
+
 type Handler struct {
 	client *http.Client
 	// wait pauses between upload attempts.
 	wait func(context.Context, time.Duration) error
 	// logf records transfer measurements. It is log.Printf unless a test replaces it.
 	logf func(string, ...any)
+	// slots limits transfers that are reading or writing. Nil means no limit.
+	slots chan struct{}
 }
 
 func NewHandler(client *http.Client) *Handler {
 	if client == nil {
 		client = storagehttp.NewClient(30 * time.Minute)
 	}
-	return &Handler{client: client, wait: sleepContext, logf: log.Printf}
+	return &Handler{client: client, wait: sleepContext, logf: log.Printf, slots: transferSlots()}
+}
+
+func transferSlots() chan struct{} {
+	n := defaultTransferSlots
+	if raw := os.Getenv("BEAM_WORKER_TRANSFER_CONCURRENCY"); raw != "" {
+		parsed, err := strconv.Atoi(raw)
+		if err == nil {
+			n = parsed
+		}
+	}
+	if n == 0 {
+		n = defaultTransferSlots
+	}
+	if n < 0 {
+		return nil
+	}
+	return make(chan struct{}, n)
+}
+
+func (h *Handler) acquireSlot(ctx context.Context) error {
+	if h.slots == nil {
+		return nil
+	}
+	select {
+	case h.slots <- struct{}{}:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (h *Handler) releaseSlot() {
+	if h.slots == nil {
+		return
+	}
+	<-h.slots
 }
 
 func (h *Handler) Kind() domain.Kind { return domain.KindTransferMultipart }
@@ -238,6 +286,10 @@ func (r partResult) record(outputs map[string]string, prefix string, part contra
 }
 
 func (h *Handler) executePart(ctx context.Context, part contracts.TransferPart) (partResult, error) {
+	if err := h.acquireSlot(ctx); err != nil {
+		return partResult{}, err
+	}
+	defer h.releaseSlot()
 	enterTransfer()
 	defer leaveTransfer()
 	if part.Authenticated() {
@@ -303,15 +355,73 @@ func (h *Handler) readSourceOnce(ctx context.Context, part contracts.TransferPar
 	var expected atomic.Int64
 	expected.Store(part.Length)
 	attemptCtx, stop := watchStall(ctx, &counter.n, &expected)
-	response, err := h.openSourceFrom(attemptCtx, part, 0, "")
-	if err != nil {
-		stop()
-		traceFrom(ctx).pace(part.Index, "source", 0, counter.n.Load(), time.Since(started), counter.blockedFor(), counter.longestGap(), 0, counter.waitedInRead())
-		if ctx.Err() != nil {
-			return nil, ctx.Err()
+	defer stop()
+
+	type bodyResult struct {
+		body []byte
+		err  error
+	}
+	out := make(chan bodyResult, 2)
+	go func() {
+		body, err := h.readBody(ctx, attemptCtx, part, counter, started)
+		out <- bodyResult{body: body, err: err}
+	}()
+
+	// A second GET, only when the first connection is too slow to finish this
+	// side inside copyBudget. The signed request is repeated as-is: a Range
+	// header makes R2 return 403. The first full body wins and the other is
+	// cancelled.
+	timer := time.NewTimer(hedgeAfter)
+	defer timer.Stop()
+	var hedgeCancel context.CancelFunc
+	defer func() {
+		if hedgeCancel != nil {
+			hedgeCancel()
 		}
-		if stalled(ctx, attemptCtx) {
-			traceFrom(ctx).stalled(part.Index, "source", 0)
+	}()
+	pending := 1
+	hedged := false
+	var lastErr error
+	for pending > 0 {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-timer.C:
+			if hedged || !tooSlow(counter.n.Load(), part.Length, time.Since(started), copyBudget) {
+				continue
+			}
+			hedged = true
+			hedgeCtx, cancel := context.WithCancel(ctx)
+			hedgeCancel = cancel
+			pending++
+			go func() {
+				hedgeCounter := &byteCounter{onFirst: func() { traceFrom(ctx).moved(part.Index, "source") }}
+				body, err := h.readBody(ctx, hedgeCtx, part, hedgeCounter, time.Now())
+				out <- bodyResult{body: body, err: err}
+			}()
+		case result := <-out:
+			pending--
+			if result.err == nil && int64(len(result.body)) == part.Length {
+				return result.body, nil
+			}
+			lastErr = result.err
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	return nil, lastErr
+}
+
+func (h *Handler) readBody(parent, attempt context.Context, part contracts.TransferPart, counter *byteCounter, started time.Time) ([]byte, error) {
+	response, err := h.openSourceFrom(attempt, part, 0, "")
+	if err != nil {
+		traceFrom(parent).pace(part.Index, "source", 0, counter.n.Load(), time.Since(started), counter.blockedFor(), counter.longestGap(), 0, counter.waitedInRead())
+		if parent.Err() != nil {
+			return nil, parent.Err()
+		}
+		if stalled(parent, attempt) {
+			traceFrom(parent).stalled(part.Index, "source", counter.n.Load())
 			return nil, errStalled
 		}
 		return nil, err
@@ -319,22 +429,18 @@ func (h *Handler) readSourceOnce(ctx context.Context, part contracts.TransferPar
 	respWait := time.Since(started)
 	defer response.Body.Close()
 	counter.r = response.Body
-	body := make([]byte, 0, part.Length)
 	chunk := make([]byte, part.Length)
 	n, readErr := io.ReadFull(counter, chunk)
-	stop()
-	if n > 0 {
-		body = append(body, chunk[:n]...)
-	}
-	traceFrom(ctx).pace(part.Index, "source", response.StatusCode, int64(len(body)), time.Since(started), counter.blockedFor(), counter.longestGap(), respWait, counter.waitedInRead())
+	body := chunk[:n]
+	traceFrom(parent).pace(part.Index, "source", response.StatusCode, int64(len(body)), time.Since(started), counter.blockedFor(), counter.longestGap(), respWait, counter.waitedInRead())
 	if int64(len(body)) == part.Length {
 		return body, nil
 	}
-	if ctx.Err() != nil {
-		return nil, ctx.Err()
+	if parent.Err() != nil {
+		return nil, parent.Err()
 	}
-	if stalled(ctx, attemptCtx) {
-		traceFrom(ctx).stalled(part.Index, "source", int64(len(body)))
+	if stalled(parent, attempt) {
+		traceFrom(parent).stalled(part.Index, "source", int64(len(body)))
 		return nil, errStalled
 	}
 	if readErr == nil || readErr == io.EOF {
@@ -349,8 +455,12 @@ func (h *Handler) putPresigned(ctx context.Context, part contracts.TransferPart,
 	if part.ExpectedSHA256 != "" && !strings.EqualFold(digest, part.ExpectedSHA256) {
 		return partResult{bytes: int64(len(body)), sha256: digest}, fmt.Errorf("SHA-256 mismatch: got %s", digest)
 	}
+	attempt := 0
 	return h.retryPresigned(ctx, func() (partResult, error) {
-		return h.putPresignedOnce(ctx, part, body, digest)
+		attempt++
+		// The last try is not abandoned for slowness. Cancelling every slow
+		// upload would retry until Beam cancels the offer.
+		return h.putPresignedOnce(ctx, part, body, digest, attempt < presignedAttempts)
 	})
 }
 
@@ -392,17 +502,32 @@ func (h *Handler) retryPresigned(ctx context.Context, attemptFn func() (partResu
 	}
 }
 
-func (h *Handler) putPresignedOnce(ctx context.Context, part contracts.TransferPart, body []byte, digest string) (partResult, error) {
+func (h *Handler) putPresignedOnce(ctx context.Context, part contracts.TransferPart, body []byte, digest string, allowAbort bool) (partResult, error) {
 	destinationMethod := strings.ToUpper(strings.TrimSpace(part.Destination.Method))
 	if destinationMethod == "" {
 		destinationMethod = http.MethodPut
 	}
 	started := time.Now()
 	counter := &byteCounter{r: bytes.NewReader(body), onFirst: func() { traceFrom(ctx).moved(part.Index, "destination") }}
-	var expected atomic.Int64
-	expected.Store(int64(len(body)))
-	attemptCtx, stop := watchStall(ctx, &counter.n, &expected)
-	defer stop()
+	// Abandon this attempt only when TCP acknowledgements are too slow to
+	// finish the body inside copyBudget. A quiet userspace Read is not enough:
+	// the kernel send buffer can hold 16 MiB while the peer is still accepting
+	// it, and cancelling that throws away bytes already on the wire.
+	attemptCtx, cancel := context.WithCancelCause(ctx)
+	defer cancel(nil)
+	connReady := make(chan net.Conn, 1)
+	attemptCtx = httptrace.WithClientTrace(attemptCtx, &httptrace.ClientTrace{
+		GotConn: func(info httptrace.GotConnInfo) {
+			select {
+			case connReady <- info.Conn:
+			default:
+			}
+		},
+	})
+	if allowAbort && int64(len(body)) >= hedgeMinBytes {
+		after, idle, budget, minBytes := hedgeAfter, ackIdle, copyBudget, hedgeMinBytes
+		go watchAck(attemptCtx, cancel, connReady, int64(len(body)), after, idle, budget, minBytes)
+	}
 	destinationRequest, err := http.NewRequestWithContext(attemptCtx, destinationMethod, part.Destination.URL, counter)
 	if err != nil {
 		return partResult{}, fmt.Errorf("create destination request: %w", err)
@@ -422,9 +547,8 @@ func (h *Handler) putPresignedOnce(ctx context.Context, part contracts.TransferP
 		if ctx.Err() != nil {
 			return partResult{bytes: int64(len(body))}, ctx.Err()
 		}
-		if stalled(ctx, attemptCtx) {
-			traceFrom(ctx).stalled(part.Index, "destination", counter.n.Load())
-			return partResult{bytes: int64(len(body))}, errStalled
+		if context.Cause(attemptCtx) == errStalled {
+			return partResult{bytes: counter.n.Load()}, errStalled
 		}
 		return partResult{bytes: int64(len(body))}, fmt.Errorf("write destination: %w", err)
 	}
