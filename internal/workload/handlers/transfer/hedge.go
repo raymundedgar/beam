@@ -2,20 +2,27 @@ package transfer
 
 import (
 	"context"
+	"errors"
 	"net"
 	"time"
 )
 
-// hedgeAfter is how long a connection may run before its rate is judged.
-// copyBudget is the time one side (the download or the upload) may take and
-// still leave room for the other side inside a 10 second offer. hedgeMinBytes
-// skips the check for the small objects used in tests and for tiny parts.
+// hedgeAfter is how long a download may run before its rate is judged.
+// sourceBudget is the time that download may take and still leave the upload
+// inside Beam's cut. hedgeMinBytes skips the check for tiny parts and tests.
+// maxSourceReplacements caps how many slow connections are discarded before
+// the last one is allowed to finish.
+const maxSourceReplacements = 8
+
 var (
-	hedgeAfter    = 1500 * time.Millisecond
-	copyBudget    = 8 * time.Second
-	ackIdle       = 1500 * time.Millisecond
+	hedgeAfter    = 800 * time.Millisecond
+	sourceBudget  = 4 * time.Second
 	hedgeMinBytes = int64(1 << 20)
 )
+
+// errReplaced closes a download that cannot finish inside sourceBudget.
+// The signed GET is repeated. It is not a task result.
+var errReplaced = errors.New("slow source connection closed")
 
 // tooSlow reports that moved bytes cannot reach total inside budget at the
 // rate observed over elapsed. A finished body is never slow.
@@ -35,12 +42,13 @@ func rateTooSlow(moved, total int64, elapsed, budget time.Duration, minBytes int
 	return rate < need
 }
 
-// watchAck cancels the attempt when acknowledged TCP bytes are too slow.
-// Userspace writes are not the signal: they stop once the send buffer is full
-// even while the peer is still draining it. The last attempt passes allow
-// false and is left to finish. Durations are copies so a test can change the
-// package values without racing this goroutine.
-func watchAck(ctx context.Context, cancel context.CancelCauseFunc, connReady <-chan net.Conn, total int64, after, idle, budget time.Duration, minBytes int64) {
+// watchAck cancels the attempt when acknowledged TCP bytes stop increasing.
+// A low average rate is not enough: at 1.5 seconds a live upload can already
+// have 20 MiB in the send buffer while acknowledgements lag, and closing it
+// restarts the body under Beam's deadline. The last attempt does not call
+// this. Durations are arguments so a test can change the package values
+// without racing this goroutine.
+func watchAck(ctx context.Context, cancel context.CancelCauseFunc, connReady <-chan net.Conn, total int64, after, idle time.Duration) {
 	if cancel == nil {
 		return
 	}
@@ -60,11 +68,7 @@ func watchAck(ctx context.Context, cancel context.CancelCauseFunc, connReady <-c
 		return
 	}
 	acked, ok := bytesAcked(conn)
-	if !ok {
-		return
-	}
-	if rateTooSlow(acked, total, after, budget, minBytes) {
-		cancel(errStalled)
+	if !ok || acked >= total {
 		return
 	}
 	idleTimer := time.NewTimer(idle)
@@ -75,10 +79,10 @@ func watchAck(ctx context.Context, cancel context.CancelCauseFunc, connReady <-c
 	case <-idleTimer.C:
 	}
 	later, ok := bytesAcked(conn)
-	if !ok {
+	if !ok || later >= total {
 		return
 	}
-	if rateTooSlow(later, total, after+idle, budget, minBytes) {
+	if later-acked < 1<<20 {
 		cancel(errStalled)
 	}
 }

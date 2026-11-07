@@ -54,12 +54,9 @@ type partCheckpoint struct {
 }
 
 // defaultTransferSlots is how many presigned transfers may move bytes at once.
-// A wave is about eight offers, and the offer clock runs while a task waits
-// for a slot. Three slots left the later offers cancelled before they opened
-// a connection. Slow copies in those waves were one bad connection at about
-// 2 MiB/s, including while a single transfer was active, so the slot count
-// was not the speed limit.
-const defaultTransferSlots = 8
+// A wave can be nine offers. The offer clock runs while a task waits for a
+// slot, and Beam cancels whatever has not finished at about 11 seconds.
+const defaultTransferSlots = 12
 
 type Handler struct {
 	client *http.Client
@@ -314,6 +311,7 @@ func (h *Handler) executeResumablePresigned(ctx context.Context, part contracts.
 func (h *Handler) readSource(ctx context.Context, part contracts.TransferPart) ([]byte, error) {
 	var lastErr error
 	httpAttempts := 0
+	replacements := 0
 	for {
 		if err := ctx.Err(); err != nil {
 			return nil, err
@@ -321,7 +319,10 @@ func (h *Handler) readSource(ctx context.Context, part contracts.TransferPart) (
 		// Restart from the signed request. Adding Range or If-Range changes a
 		// presigned URL and R2 answers 403 SignatureDoesNotMatch, which the
 		// worker would report as its own failure.
-		body, err := h.readSourceOnce(ctx, part)
+		// A slow connection is closed and the signed GET is repeated. Keeping
+		// the slow one, and only one extra, left both near 1 MiB/s until Beam
+		// cancelled the offer.
+		body, err := h.readSourceOnce(ctx, part, replacements < maxSourceReplacements)
 		if err == nil {
 			return body, nil
 		}
@@ -329,6 +330,10 @@ func (h *Handler) readSource(ctx context.Context, part contracts.TransferPart) (
 			return nil, ctx.Err()
 		}
 		lastErr = err
+		if errors.Is(err, errReplaced) {
+			replacements++
+			continue
+		}
 		if errors.Is(err, errStalled) {
 			if waitErr := h.backoff(ctx, 1); waitErr != nil {
 				<-ctx.Done()
@@ -349,68 +354,40 @@ func (h *Handler) readSource(ctx context.Context, part contracts.TransferPart) (
 	}
 }
 
-func (h *Handler) readSourceOnce(ctx context.Context, part contracts.TransferPart) ([]byte, error) {
+func (h *Handler) readSourceOnce(ctx context.Context, part contracts.TransferPart, allowReplace bool) ([]byte, error) {
 	started := time.Now()
 	counter := &byteCounter{onFirst: func() { traceFrom(ctx).moved(part.Index, "source") }}
 	var expected atomic.Int64
 	expected.Store(part.Length)
-	attemptCtx, stop := watchStall(ctx, &counter.n, &expected)
+	attemptCtx, cancel := context.WithCancelCause(ctx)
+	defer cancel(context.Canceled)
+	stallCtx, stop := watchStall(attemptCtx, &counter.n, &expected)
 	defer stop()
-
-	type bodyResult struct {
-		body []byte
-		err  error
-	}
-	out := make(chan bodyResult, 2)
-	go func() {
-		body, err := h.readBody(ctx, attemptCtx, part, counter, started)
-		out <- bodyResult{body: body, err: err}
-	}()
-
-	// A second GET, only when the first connection is too slow to finish this
-	// side inside copyBudget. The signed request is repeated as-is: a Range
-	// header makes R2 return 403. The first full body wins and the other is
-	// cancelled.
-	timer := time.NewTimer(hedgeAfter)
-	defer timer.Stop()
-	var hedgeCancel context.CancelFunc
-	defer func() {
-		if hedgeCancel != nil {
-			hedgeCancel()
-		}
-	}()
-	pending := 1
-	hedged := false
-	var lastErr error
-	for pending > 0 {
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-timer.C:
-			if hedged || !tooSlow(counter.n.Load(), part.Length, time.Since(started), copyBudget) {
-				continue
+	if allowReplace && part.Length >= hedgeMinBytes {
+		// Copied before the goroutine so tests can change the package values.
+		probe, budget, minBytes := hedgeAfter, sourceBudget, hedgeMinBytes
+		length := part.Length
+		go func() {
+			timer := time.NewTimer(probe)
+			defer timer.Stop()
+			select {
+			case <-attemptCtx.Done():
+				return
+			case <-timer.C:
 			}
-			hedged = true
-			hedgeCtx, cancel := context.WithCancel(ctx)
-			hedgeCancel = cancel
-			pending++
-			go func() {
-				hedgeCounter := &byteCounter{onFirst: func() { traceFrom(ctx).moved(part.Index, "source") }}
-				body, err := h.readBody(ctx, hedgeCtx, part, hedgeCounter, time.Now())
-				out <- bodyResult{body: body, err: err}
-			}()
-		case result := <-out:
-			pending--
-			if result.err == nil && int64(len(result.body)) == part.Length {
-				return result.body, nil
+			if rateTooSlow(counter.n.Load(), length, probe, budget, minBytes) {
+				cancel(errReplaced)
 			}
-			lastErr = result.err
-		}
+		}()
 	}
-	if err := ctx.Err(); err != nil {
-		return nil, err
+	body, err := h.readBody(ctx, stallCtx, part, counter, started)
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
 	}
-	return nil, lastErr
+	if context.Cause(attemptCtx) == errReplaced {
+		return nil, errReplaced
+	}
+	return body, err
 }
 
 func (h *Handler) readBody(parent, attempt context.Context, part contracts.TransferPart, counter *byteCounter, started time.Time) ([]byte, error) {
@@ -509,10 +486,9 @@ func (h *Handler) putPresignedOnce(ctx context.Context, part contracts.TransferP
 	}
 	started := time.Now()
 	counter := &byteCounter{r: bytes.NewReader(body), onFirst: func() { traceFrom(ctx).moved(part.Index, "destination") }}
-	// Abandon this attempt only when TCP acknowledgements are too slow to
-	// finish the body inside copyBudget. A quiet userspace Read is not enough:
-	// the kernel send buffer can hold 16 MiB while the peer is still accepting
-	// it, and cancelling that throws away bytes already on the wire.
+	// Close this attempt only when TCP acknowledgements stop. A 1.5s rate
+	// check cancelled uploads that had already handed over 20 MiB and were
+	// still accepted by the peer; those tasks then died at Beam's deadline.
 	attemptCtx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
 	connReady := make(chan net.Conn, 1)
@@ -525,8 +501,7 @@ func (h *Handler) putPresignedOnce(ctx context.Context, part contracts.TransferP
 		},
 	})
 	if allowAbort && int64(len(body)) >= hedgeMinBytes {
-		after, idle, budget, minBytes := hedgeAfter, ackIdle, copyBudget, hedgeMinBytes
-		go watchAck(attemptCtx, cancel, connReady, int64(len(body)), after, idle, budget, minBytes)
+		go watchAck(attemptCtx, cancel, connReady, int64(len(body)), 2*time.Second, 2*time.Second)
 	}
 	destinationRequest, err := http.NewRequestWithContext(attemptCtx, destinationMethod, part.Destination.URL, counter)
 	if err != nil {
