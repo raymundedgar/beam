@@ -245,6 +245,8 @@ def enrich(task, medians):
         "bytes": nbytes,
         "seconds": seconds,
         "mib_s": mib_s,
+        "started": start,
+        "ended": None if state in IN_FLIGHT else end,
         "updated": parse_time(task.get("updated_at")),
         "created": parse_time(task.get("created_at")),
         "in_flight": state in IN_FLIGHT,
@@ -391,13 +393,17 @@ def print_rows(rows):
     if not rows:
         print("  (none)")
         return
-    print(f"  {'KIND':<32} {'STATE':<10} {'SIZE':>10} {'TIME':>8} {'RATE':>10}  {'STOP':<18} {'UPDATED'}")
-    print("  " + "-" * 106)
+    print(
+        f"  {'KIND':<32} {'STATE':<10} {'SIZE':>10} {'TIME':>8} {'RATE':>10}  "
+        f"{'STOP':<18} {'START':<12} {'END':<12} {'UPDATED'}"
+    )
+    print("  " + "-" * 130)
     for row in rows:
         line = (
             f"  {row['kind']:<32} {row['state']:<10} {fmt_mib(row['bytes']):>10} "
             f"{fmt_secs(row['seconds']):>8} {fmt_rate(row['mib_s']):>10}  "
-            f"{(row.get('stop') or '—'):<18} {local_clock(row['updated'])}"
+            f"{(row.get('stop') or '—'):<18} {local_clock(row.get('started')):<12} "
+            f"{local_clock(row.get('ended')):<12} {local_clock(row['updated'])}"
         )
         if row["state"] != "completed" and not row["in_flight"]:
             line = emphasize(line)
