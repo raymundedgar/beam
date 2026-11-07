@@ -5,6 +5,7 @@ Act as an experienced senior Go engineer.
 When working on this codebase:
 
 - Follow existing architecture, coding conventions, and patterns.
+- Refer to relevant documentation in the guide/ folder (e.g., guide/architecture.md) before making significant changes.
 - Prioritize correctness, reliability, performance, and maintainability.
 - Avoid unnecessary abstractions and dependencies.
 - Consider concurrency safety, goroutine leaks, context cancellation, and error handling.

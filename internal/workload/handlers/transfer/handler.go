@@ -9,11 +9,14 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -52,13 +55,15 @@ type Handler struct {
 	client *http.Client
 	// wait pauses between upload attempts.
 	wait func(context.Context, time.Duration) error
+	// logf records transfer measurements. It is log.Printf unless a test replaces it.
+	logf func(string, ...any)
 }
 
 func NewHandler(client *http.Client) *Handler {
 	if client == nil {
 		client = storagehttp.NewClient(30 * time.Minute)
 	}
-	return &Handler{client: client, wait: sleepContext}
+	return &Handler{client: client, wait: sleepContext, logf: log.Printf}
 }
 
 func (h *Handler) Kind() domain.Kind { return domain.KindTransferMultipart }
@@ -117,6 +122,9 @@ func (h *Handler) Execute(ctx context.Context, spec domain.Spec) (domain.Result,
 	if err := json.Unmarshal(spec.Payload, &transfer); err != nil {
 		return domain.Result{}, err
 	}
+	trace := &transferLog{workload: spec.WorkloadID, attempt: spec.AttemptID, started: time.Now(), printf: h.logf}
+	ctx = withTrace(ctx, trace)
+	trace.admitted(len(transfer.Parts))
 	if transfer.Fanout {
 		return h.executeFanout(ctx, transfer)
 	}
@@ -128,7 +136,8 @@ func (h *Handler) Execute(ctx context.Context, spec domain.Spec) (domain.Result,
 		resume.Parts = make(map[string]partCheckpoint)
 	}
 	outputs := make(map[string]string, len(transfer.Parts)*2)
-	total := resume.Bytes
+	var total = resume.Bytes
+	pending := make([]contracts.TransferPart, 0, len(transfer.Parts))
 	for _, part := range transfer.Parts {
 		partKey := strconv.Itoa(part.Index)
 		prefix := "part." + partKey + "."
@@ -137,25 +146,63 @@ func (h *Handler) Execute(ctx context.Context, spec domain.Spec) (domain.Result,
 				requests: completed.RequestCount, providerPartID: completed.ProviderPartID}.record(outputs, prefix, part)
 			continue
 		}
-		partResult, err := h.executePart(ctx, part)
-		if err != nil {
-			if part.Authenticated() {
-				partResult.record(outputs, prefix, part)
-				outputs[prefix+"error"] = uploadFailureClass(err)
-				recordThrottle(outputs, prefix, err)
+		pending = append(pending, part)
+	}
+	runCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	gate := newMemoryGate(spec.Resources.MemoryBytes)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var failed error
+	for _, part := range pending {
+		wg.Add(1)
+		go func(part contracts.TransferPart) {
+			defer wg.Done()
+			held, acquireErr := gate.acquire(runCtx, bufferedBytes(part.Length))
+			if acquireErr != nil {
+				mu.Lock()
+				if failed == nil {
+					failed = fmt.Errorf("part %d: %w", part.Index, acquireErr)
+				}
+				mu.Unlock()
+				return
 			}
-			return domain.Result{BytesProcessed: total, Outputs: outputs}, fmt.Errorf("part %d: %w", part.Index, err)
-		}
-		total += partResult.bytes
-		partResult.record(outputs, prefix, part)
-		resume.Bytes = total
-		resume.Parts[partKey] = partCheckpoint{Bytes: partResult.bytes, SHA256: partResult.sha256, ETag: partResult.etag,
-			SHA1: partResult.sha1, RequestCount: partResult.requests, ProviderPartID: partResult.providerPartID}
-		if err := workloadcheckpoint.Save(ctx, multipartCheckpointSchema, map[string]string{
-			"completed_part": partKey,
-		}, resume); err != nil && !errors.Is(err, workloadcheckpoint.ErrUnavailable) {
-			return domain.Result{BytesProcessed: total, Outputs: outputs}, fmt.Errorf("save multipart checkpoint: %w", err)
-		}
+			defer gate.release(held)
+			partKey := strconv.Itoa(part.Index)
+			prefix := "part." + partKey + "."
+			partResult, err := h.executePart(runCtx, part)
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				if part.Authenticated() {
+					partResult.record(outputs, prefix, part)
+					outputs[prefix+"error"] = uploadFailureClass(err)
+					recordThrottle(outputs, prefix, err)
+				}
+				if failed == nil {
+					failed = fmt.Errorf("part %d: %w", part.Index, err)
+					cancel()
+				}
+				return
+			}
+			total += partResult.bytes
+			partResult.record(outputs, prefix, part)
+			resume.Bytes = total
+			resume.Parts[partKey] = partCheckpoint{Bytes: partResult.bytes, SHA256: partResult.sha256, ETag: partResult.etag,
+				SHA1: partResult.sha1, RequestCount: partResult.requests, ProviderPartID: partResult.providerPartID}
+			if err := workloadcheckpoint.Save(ctx, multipartCheckpointSchema, map[string]string{
+				"completed_part": partKey,
+			}, resume); err != nil && !errors.Is(err, workloadcheckpoint.ErrUnavailable) && failed == nil {
+				failed = fmt.Errorf("save multipart checkpoint: %w", err)
+				cancel()
+				return
+			}
+			trace.partDone(part.Index, partResult.bytes)
+		}(part)
+	}
+	wg.Wait()
+	if failed != nil {
+		return domain.Result{BytesProcessed: total, Outputs: outputs}, failed
 	}
 	return domain.Result{BytesProcessed: total, Outputs: outputs}, nil
 }
@@ -191,34 +238,17 @@ func (r partResult) record(outputs map[string]string, prefix string, part contra
 }
 
 func (h *Handler) executePart(ctx context.Context, part contracts.TransferPart) (partResult, error) {
+	enterTransfer()
+	defer leaveTransfer()
 	if part.Authenticated() {
 		return h.executeAuthenticatedPart(ctx, part)
 	}
 	if part.Length > 0 && part.Length <= maxResumablePart {
 		return h.executeResumablePresigned(ctx, part)
 	}
-	var last partResult
-	var lastErr error
-	for attempt := 1; attempt <= presignedAttempts; attempt++ {
-		if err := ctx.Err(); err != nil {
-			if lastErr != nil {
-				return last, lastErr
-			}
-			return partResult{}, err
-		}
-		last, lastErr = h.executePresignedPart(ctx, part)
-		if lastErr == nil || !transientTransferError(lastErr) || attempt == presignedAttempts {
-			return last, lastErr
-		}
-		delay := time.Duration(attempt) * uploadRetryBackoff
-		if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) <= delay {
-			return last, lastErr
-		}
-		if err := h.wait(ctx, delay); err != nil {
-			return last, lastErr
-		}
-	}
-	return last, lastErr
+	return h.retryPresigned(ctx, func() (partResult, error) {
+		return h.executePresignedPart(ctx, part)
+	})
 }
 
 func (h *Handler) executeResumablePresigned(ctx context.Context, part contracts.TransferPart) (partResult, error) {
@@ -230,61 +260,87 @@ func (h *Handler) executeResumablePresigned(ctx context.Context, part contracts.
 }
 
 func (h *Handler) readSource(ctx context.Context, part contracts.TransferPart) ([]byte, error) {
-	buf := make([]byte, 0, part.Length)
-	var etag string
 	var lastErr error
-	for attempt := 1; attempt <= presignedAttempts; attempt++ {
+	httpAttempts := 0
+	for {
 		if err := ctx.Err(); err != nil {
-			if lastErr != nil {
-				return buf, lastErr
-			}
-			return buf, err
+			return nil, err
 		}
-		resume := int64(len(buf))
-		match := etag
-		if resume > 0 && match == "" {
-			buf = buf[:0]
-			resume = 0
+		// Restart from the signed request. Adding Range or If-Range changes a
+		// presigned URL and R2 answers 403 SignatureDoesNotMatch, which the
+		// worker would report as its own failure.
+		body, err := h.readSourceOnce(ctx, part)
+		if err == nil {
+			return body, nil
 		}
-		response, err := h.openSourceFrom(ctx, part, resume, match)
-		if err != nil {
-			lastErr = err
-			if !transientTransferError(err) || attempt == presignedAttempts {
-				return buf, err
-			}
-			if err := h.backoff(ctx, attempt); err != nil {
-				return buf, lastErr
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		lastErr = err
+		if errors.Is(err, errStalled) {
+			if waitErr := h.backoff(ctx, 1); waitErr != nil {
+				<-ctx.Done()
+				return nil, ctx.Err()
 			}
 			continue
 		}
-		if resume > 0 && response.StatusCode == http.StatusOK {
-			buf = buf[:0]
+		httpAttempts++
+		if !transientTransferError(err) || httpAttempts >= presignedAttempts {
+			return nil, err
 		}
-		if tag := strongETag(response.Header.Get("ETag")); tag != "" {
-			etag = tag
-		}
-		need := int(part.Length - int64(len(buf)))
-		chunk := make([]byte, need)
-		n, readErr := io.ReadFull(response.Body, chunk)
-		_ = response.Body.Close()
-		if n > 0 {
-			buf = append(buf, chunk[:n]...)
-		}
-		if int64(len(buf)) == part.Length {
-			return buf, nil
-		}
-		if readErr == nil || readErr == io.EOF {
-			readErr = io.ErrUnexpectedEOF
-		}
-		lastErr = fmt.Errorf("fetch source: %w", readErr)
-		if !transientTransferError(readErr) || attempt == presignedAttempts {
-			return buf, lastErr
-		}
-		if err := h.backoff(ctx, attempt); err != nil {
-			return buf, lastErr
+		if waitErr := h.backoff(ctx, httpAttempts); waitErr != nil {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			return nil, lastErr
 		}
 	}
-	return buf, lastErr
+}
+
+func (h *Handler) readSourceOnce(ctx context.Context, part contracts.TransferPart) ([]byte, error) {
+	started := time.Now()
+	counter := &byteCounter{onFirst: func() { traceFrom(ctx).moved(part.Index, "source") }}
+	var expected atomic.Int64
+	expected.Store(part.Length)
+	attemptCtx, stop := watchStall(ctx, &counter.n, &expected)
+	response, err := h.openSourceFrom(attemptCtx, part, 0, "")
+	if err != nil {
+		stop()
+		traceFrom(ctx).pace(part.Index, "source", 0, counter.n.Load(), time.Since(started), counter.blockedFor(), counter.longestGap(), 0, counter.waitedInRead())
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		if stalled(ctx, attemptCtx) {
+			traceFrom(ctx).stalled(part.Index, "source", 0)
+			return nil, errStalled
+		}
+		return nil, err
+	}
+	respWait := time.Since(started)
+	defer response.Body.Close()
+	counter.r = response.Body
+	body := make([]byte, 0, part.Length)
+	chunk := make([]byte, part.Length)
+	n, readErr := io.ReadFull(counter, chunk)
+	stop()
+	if n > 0 {
+		body = append(body, chunk[:n]...)
+	}
+	traceFrom(ctx).pace(part.Index, "source", response.StatusCode, int64(len(body)), time.Since(started), counter.blockedFor(), counter.longestGap(), respWait, counter.waitedInRead())
+	if int64(len(body)) == part.Length {
+		return body, nil
+	}
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	if stalled(ctx, attemptCtx) {
+		traceFrom(ctx).stalled(part.Index, "source", int64(len(body)))
+		return nil, errStalled
+	}
+	if readErr == nil || readErr == io.EOF {
+		readErr = io.ErrUnexpectedEOF
+	}
+	return nil, fmt.Errorf("fetch source: %w", readErr)
 }
 
 func (h *Handler) putPresigned(ctx context.Context, part contracts.TransferPart, body []byte) (partResult, error) {
@@ -293,24 +349,47 @@ func (h *Handler) putPresigned(ctx context.Context, part contracts.TransferPart,
 	if part.ExpectedSHA256 != "" && !strings.EqualFold(digest, part.ExpectedSHA256) {
 		return partResult{bytes: int64(len(body)), sha256: digest}, fmt.Errorf("SHA-256 mismatch: got %s", digest)
 	}
+	return h.retryPresigned(ctx, func() (partResult, error) {
+		return h.putPresignedOnce(ctx, part, body, digest)
+	})
+}
+
+// retryPresigned repeats a presigned attempt. HTTP 408, 429, and 5xx stop after
+// presignedAttempts. A stall retries until the offer context ends, and that end
+// is the returned error, so the task is cancelled rather than failed.
+func (h *Handler) retryPresigned(ctx context.Context, attemptFn func() (partResult, error)) (partResult, error) {
 	var last partResult
 	var lastErr error
-	for attempt := 1; attempt <= presignedAttempts; attempt++ {
+	httpAttempts := 0
+	for {
 		if err := ctx.Err(); err != nil {
-			if lastErr != nil {
-				return last, lastErr
-			}
-			return partResult{}, err
+			return last, err
 		}
-		last, lastErr = h.putPresignedOnce(ctx, part, body, digest)
-		if lastErr == nil || !transientTransferError(lastErr) || attempt == presignedAttempts {
+		last, lastErr = attemptFn()
+		if lastErr == nil {
+			return last, nil
+		}
+		if ctx.Err() != nil {
+			return last, ctx.Err()
+		}
+		if errors.Is(lastErr, errStalled) {
+			if waitErr := h.backoff(ctx, 1); waitErr != nil {
+				<-ctx.Done()
+				return last, ctx.Err()
+			}
+			continue
+		}
+		httpAttempts++
+		if !transientTransferError(lastErr) || httpAttempts >= presignedAttempts {
 			return last, lastErr
 		}
-		if err := h.backoff(ctx, attempt); err != nil {
+		if waitErr := h.backoff(ctx, httpAttempts); waitErr != nil {
+			if ctx.Err() != nil {
+				return last, ctx.Err()
+			}
 			return last, lastErr
 		}
 	}
-	return last, lastErr
 }
 
 func (h *Handler) putPresignedOnce(ctx context.Context, part contracts.TransferPart, body []byte, digest string) (partResult, error) {
@@ -318,7 +397,13 @@ func (h *Handler) putPresignedOnce(ctx context.Context, part contracts.TransferP
 	if destinationMethod == "" {
 		destinationMethod = http.MethodPut
 	}
-	destinationRequest, err := http.NewRequestWithContext(ctx, destinationMethod, part.Destination.URL, bytes.NewReader(body))
+	started := time.Now()
+	counter := &byteCounter{r: bytes.NewReader(body), onFirst: func() { traceFrom(ctx).moved(part.Index, "destination") }}
+	var expected atomic.Int64
+	expected.Store(int64(len(body)))
+	attemptCtx, stop := watchStall(ctx, &counter.n, &expected)
+	defer stop()
+	destinationRequest, err := http.NewRequestWithContext(attemptCtx, destinationMethod, part.Destination.URL, counter)
 	if err != nil {
 		return partResult{}, fmt.Errorf("create destination request: %w", err)
 	}
@@ -328,7 +413,19 @@ func (h *Handler) putPresignedOnce(ctx context.Context, part contracts.TransferP
 	}
 	destinationRequest.ContentLength = int64(len(body))
 	destinationResponse, err := h.client.Do(destinationRequest)
+	respWait := time.Duration(0)
+	if !counter.last.IsZero() {
+		respWait = time.Since(counter.last)
+	}
+	traceFrom(ctx).pace(part.Index, "destination", statusCode(destinationResponse), counter.n.Load(), time.Since(started), counter.blockedFor(), counter.longestGap(), respWait, counter.waitedInRead())
 	if err != nil {
+		if ctx.Err() != nil {
+			return partResult{bytes: int64(len(body))}, ctx.Err()
+		}
+		if stalled(ctx, attemptCtx) {
+			traceFrom(ctx).stalled(part.Index, "destination", counter.n.Load())
+			return partResult{bytes: int64(len(body))}, errStalled
+		}
 		return partResult{bytes: int64(len(body))}, fmt.Errorf("write destination: %w", err)
 	}
 	defer destinationResponse.Body.Close()
@@ -350,15 +447,36 @@ func (h *Handler) backoff(ctx context.Context, attempt int) error {
 	return h.wait(ctx, delay)
 }
 
+func statusCode(response *http.Response) int {
+	if response == nil {
+		return 0
+	}
+	return response.StatusCode
+}
+
 func (h *Handler) executePresignedPart(ctx context.Context, part contracts.TransferPart) (partResult, error) {
-	sourceResponse, err := h.openSource(ctx, part)
+	started := time.Now()
+	sourceCounter := &byteCounter{onFirst: func() { traceFrom(ctx).moved(part.Index, "source") }}
+	var expected atomic.Int64
+	expected.Store(part.Length)
+	attemptCtx, stop := watchStall(ctx, &sourceCounter.n, &expected)
+	defer stop()
+	sourceResponse, err := h.openSource(attemptCtx, part)
 	if err != nil {
+		if ctx.Err() != nil {
+			return partResult{}, ctx.Err()
+		}
+		if stalled(ctx, attemptCtx) {
+			traceFrom(ctx).stalled(part.Index, "source", sourceCounter.n.Load())
+			return partResult{}, fmt.Errorf("fetch source: %w", errStalled)
+		}
 		return partResult{}, err
 	}
 	defer sourceResponse.Body.Close()
 
 	hash := sha256.New()
-	var source io.Reader = sourceResponse.Body
+	sourceCounter.r = sourceResponse.Body
+	var source io.Reader = sourceCounter
 	if part.Length > 0 {
 		source = io.LimitReader(source, part.Length)
 	}
@@ -367,7 +485,7 @@ func (h *Handler) executePresignedPart(ctx context.Context, part contracts.Trans
 	if destinationMethod == "" {
 		destinationMethod = http.MethodPut
 	}
-	destinationRequest, err := http.NewRequestWithContext(ctx, destinationMethod, part.Destination.URL, counter)
+	destinationRequest, err := http.NewRequestWithContext(attemptCtx, destinationMethod, part.Destination.URL, counter)
 	if err != nil {
 		return partResult{}, fmt.Errorf("create destination request: %w", err)
 	}
@@ -381,7 +499,17 @@ func (h *Handler) executePresignedPart(ctx context.Context, part contracts.Trans
 		destinationRequest.ContentLength = sourceResponse.ContentLength
 	}
 	destinationResponse, err := h.client.Do(destinationRequest)
+	// This path copies the source into the destination in one request. blocked is
+	// time the upload stopped pulling bytes; read_wait is time spent reading the source.
+	traceFrom(ctx).pace(part.Index, "stream", statusCode(destinationResponse), sourceCounter.n.Load(), time.Since(started), sourceCounter.blockedFor(), sourceCounter.longestGap(), 0, sourceCounter.waitedInRead())
 	if err != nil {
+		if ctx.Err() != nil {
+			return partResult{bytes: counter.count}, ctx.Err()
+		}
+		if stalled(ctx, attemptCtx) {
+			traceFrom(ctx).stalled(part.Index, "source", sourceCounter.n.Load())
+			return partResult{bytes: counter.count}, fmt.Errorf("fetch source: %w", errStalled)
+		}
 		return partResult{bytes: counter.count}, fmt.Errorf("write destination: %w", err)
 	}
 	defer destinationResponse.Body.Close()
