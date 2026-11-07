@@ -119,34 +119,31 @@ func TestDestinationWritePauseIsNotAborted(t *testing.T) {
 	}
 }
 
-func TestTransferSlotsSerializeUploads(t *testing.T) {
+func TestNextDownloadStartsWhileAnUploadRuns(t *testing.T) {
 	const length = 8
 	hold := make(chan struct{})
 	var closeHold sync.Once
 	release := func() { closeHold.Do(func() { close(hold) }) }
 	t.Cleanup(release)
-	var inside atomic.Int32
-	var peak atomic.Int32
+	secondDownload := make(chan struct{})
+	var once sync.Once
+	var gets atomic.Int32
 	source := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if gets.Add(1) >= 2 {
+			once.Do(func() { close(secondDownload) })
+		}
 		_, _ = w.Write([]byte("01234567"))
 	}))
 	t.Cleanup(source.Close)
 	dest := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		n := inside.Add(1)
-		for {
-			old := peak.Load()
-			if n <= old || peak.CompareAndSwap(old, n) {
-				break
-			}
-		}
 		<-hold
-		inside.Add(-1)
 		_, _ = io.Copy(io.Discard, r.Body)
 		w.WriteHeader(http.StatusOK)
 	}))
 	t.Cleanup(dest.Close)
 	handler := retryingHandler()
 	handler.slots = make(chan struct{}, 1)
+	handler.uploads = nil
 	spec := domain.Spec{
 		Kind: domain.KindTransferMultipart, Payload: twoPartPayload(t, source.URL, dest.URL, length),
 		Resources: domain.Resources{MemoryBytes: 2 * bufferedBytes(length)},
@@ -156,9 +153,10 @@ func TestTransferSlotsSerializeUploads(t *testing.T) {
 		_, err := handler.Execute(context.Background(), spec)
 		done <- err
 	}()
-	time.Sleep(80 * time.Millisecond)
-	if peak.Load() != 1 {
-		t.Fatalf("peak=%d", peak.Load())
+	select {
+	case <-secondDownload:
+	case <-time.After(2 * time.Second):
+		t.Fatal("second download waited for the upload")
 	}
 	release()
 	if err := <-done; err != nil {

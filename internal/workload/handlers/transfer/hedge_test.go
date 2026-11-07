@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -29,7 +30,7 @@ func TestTooSlowLeavesAFinishableRate(t *testing.T) {
 	if tooSlow(total/2, total, 1500*time.Millisecond, 8*time.Second) {
 		t.Fatal("half the body in 1.5s can finish inside 8s")
 	}
-	// 2 MiB at 2 MiB/s needs 8s and has only moved 1 MiB after 500ms? 
+	// 2 MiB at 2 MiB/s needs 8s and has only moved 1 MiB after 500ms?
 	// 64 KiB in 1.5s cannot finish 2 MiB in 8s.
 	if !tooSlow(64<<10, total, 1500*time.Millisecond, 8*time.Second) {
 		t.Fatal("64 KiB in 1.5s should be replaced")
@@ -141,6 +142,63 @@ func TestSlowSourceKeepsReplacingUntilAFastGet(t *testing.T) {
 	if result.BytesProcessed != int64(len(object)) || hits.Load() != 3 {
 		t.Fatalf("bytes=%d hits=%d", result.BytesProcessed, hits.Load())
 	}
+}
+
+func TestSlowUploadIsReplaced(t *testing.T) {
+	withHedge(t, 2*time.Second, 8)
+	prevProbe, prevBudget := putProbe, putBudget
+	putProbe, putBudget = 60*time.Millisecond, 80*time.Millisecond
+	t.Cleanup(func() { putProbe, putBudget = prevProbe, prevBudget })
+	object := bytesRepeat(256 << 10)
+	var puts atomic.Int32
+	source := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write(object)
+	}))
+	t.Cleanup(source.Close)
+	dest := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := puts.Add(1)
+		if n == 1 {
+			time.Sleep(200 * time.Millisecond)
+			_, _ = io.Copy(io.Discard, r.Body)
+			w.WriteHeader(http.StatusGatewayTimeout)
+			return
+		}
+		body, _ := io.ReadAll(r.Body)
+		if len(body) != len(object) {
+			t.Errorf("destination length=%d", len(body))
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(dest.Close)
+	handler := retryingHandler()
+	handler.client = smallSendBufferClient(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	result, err := handler.Execute(ctx, presignedSpec(t, source.URL, dest.URL, int64(len(object))))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.BytesProcessed != int64(len(object)) || puts.Load() != 2 {
+		t.Fatalf("bytes=%d puts=%d", result.BytesProcessed, puts.Load())
+	}
+}
+
+func smallSendBufferClient(t *testing.T) *http.Client {
+	t.Helper()
+	dialer := &net.Dialer{Control: func(_, _ string, raw syscall.RawConn) error {
+		var sockErr error
+		err := raw.Control(func(fd uintptr) {
+			sockErr = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_SNDBUF, 4096)
+		})
+		if err != nil {
+			return err
+		}
+		return sockErr
+	}}
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.DialContext = dialer.DialContext
+	transport.ExpectContinueTimeout = 0
+	return &http.Client{Transport: transport}
 }
 
 func TestBytesAckedOnTCP(t *testing.T) {

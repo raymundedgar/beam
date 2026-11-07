@@ -328,26 +328,26 @@ func (h *Handler) executePart(ctx context.Context, part contracts.TransferPart) 
 	if err := h.acquireSlot(ctx); err != nil {
 		return partResult{}, err
 	}
-	defer h.releaseSlot()
 	enterTransfer()
 	defer leaveTransfer()
 	if part.Authenticated() {
+		defer h.releaseSlot()
 		return h.executeAuthenticatedPart(ctx, part)
 	}
 	if part.Length > 0 && part.Length <= maxResumablePart {
-		return h.executeResumablePresigned(ctx, part)
+		// The slot covers the download only. Holding it through a slow upload
+		// left the rest of the wave waiting until Beam cancelled those offers.
+		body, err := h.readSource(ctx, part)
+		h.releaseSlot()
+		if err != nil {
+			return partResult{bytes: int64(len(body))}, err
+		}
+		return h.putPresigned(ctx, part, body)
 	}
+	defer h.releaseSlot()
 	return h.retryPresigned(ctx, func() (partResult, error) {
 		return h.executePresignedPart(ctx, part)
 	})
-}
-
-func (h *Handler) executeResumablePresigned(ctx context.Context, part contracts.TransferPart) (partResult, error) {
-	body, err := h.readSource(ctx, part)
-	if err != nil {
-		return partResult{bytes: int64(len(body))}, err
-	}
-	return h.putPresigned(ctx, part, body)
 }
 
 func (h *Handler) readSource(ctx context.Context, part contracts.TransferPart) ([]byte, error) {
@@ -408,19 +408,7 @@ func (h *Handler) readSourceOnce(ctx context.Context, part contracts.TransferPar
 	if allowReplace && part.Length >= hedgeMinBytes {
 		// Copied before the goroutine so tests can change the package values.
 		probe, budget, minBytes := hedgeAfter, sourceBudget, hedgeMinBytes
-		length := part.Length
-		go func() {
-			timer := time.NewTimer(probe)
-			defer timer.Stop()
-			select {
-			case <-attemptCtx.Done():
-				return
-			case <-timer.C:
-			}
-			if rateTooSlow(counter.n.Load(), length, probe, budget, minBytes) {
-				cancel(errReplaced)
-			}
-		}()
+		go watchSourceRate(attemptCtx, cancel, &counter.n, part.Length, probe, budget, minBytes)
 	}
 	body, err := h.readBody(ctx, stallCtx, part, counter, started)
 	if ctx.Err() != nil {
@@ -480,8 +468,13 @@ func (h *Handler) putPresigned(ctx context.Context, part contracts.TransferPart,
 		return partResult{bytes: int64(len(body))}, err
 	}
 	defer h.releaseUpload()
+	replaced := 0
 	return h.retryPresigned(ctx, func() (partResult, error) {
-		return h.putPresignedOnce(ctx, part, body, digest)
+		result, err := h.putPresignedOnce(ctx, part, body, digest, replaced < putReplacements)
+		if errors.Is(err, errReplaced) {
+			replaced++
+		}
+		return result, err
 	})
 }
 
@@ -503,7 +496,7 @@ func (h *Handler) retryPresigned(ctx context.Context, attemptFn func() (partResu
 		if ctx.Err() != nil {
 			return last, ctx.Err()
 		}
-		if errors.Is(lastErr, errStalled) {
+		if errors.Is(lastErr, errStalled) || errors.Is(lastErr, errReplaced) {
 			if waitErr := h.backoff(ctx, 1); waitErr != nil {
 				<-ctx.Done()
 				return last, ctx.Err()
@@ -523,18 +516,20 @@ func (h *Handler) retryPresigned(ctx context.Context, attemptFn func() (partResu
 	}
 }
 
-func (h *Handler) putPresignedOnce(ctx context.Context, part contracts.TransferPart, body []byte, digest string) (partResult, error) {
+func (h *Handler) putPresignedOnce(ctx context.Context, part contracts.TransferPart, body []byte, digest string, allowReplace bool) (partResult, error) {
 	destinationMethod := strings.ToUpper(strings.TrimSpace(part.Destination.Method))
 	if destinationMethod == "" {
 		destinationMethod = http.MethodPut
 	}
 	started := time.Now()
 	counter := &byteCounter{r: bytes.NewReader(body), onFirst: func() { traceFrom(ctx).moved(part.Index, "destination") }}
-	// Do not abandon a PUT because acknowledgements pause. In the 21:43 wave
-	// that closed uploads which had already handed over 17–31 MiB, and the
-	// replacement then took 16 seconds. The offer context still ends the
-	// upload when Beam cancels the task.
-	destinationRequest, err := http.NewRequestWithContext(ctx, destinationMethod, part.Destination.URL, counter)
+	attemptCtx, cancel := context.WithCancelCause(ctx)
+	defer cancel(context.Canceled)
+	if allowReplace && int64(len(body)) >= hedgeMinBytes {
+		probe, budget, minBytes := putProbe, putBudget, hedgeMinBytes
+		go watchPutRate(attemptCtx, cancel, &counter.n, int64(len(body)), probe, budget, minBytes)
+	}
+	destinationRequest, err := http.NewRequestWithContext(attemptCtx, destinationMethod, part.Destination.URL, counter)
 	if err != nil {
 		return partResult{}, fmt.Errorf("create destination request: %w", err)
 	}
@@ -552,6 +547,9 @@ func (h *Handler) putPresignedOnce(ctx context.Context, part contracts.TransferP
 	if err != nil {
 		if ctx.Err() != nil {
 			return partResult{bytes: int64(len(body))}, ctx.Err()
+		}
+		if context.Cause(attemptCtx) == errReplaced {
+			return partResult{bytes: counter.n.Load()}, errReplaced
 		}
 		return partResult{bytes: int64(len(body))}, fmt.Errorf("write destination: %w", err)
 	}
