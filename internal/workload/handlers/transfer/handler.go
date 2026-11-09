@@ -12,6 +12,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/http/httptrace"
 	"net/url"
 	"os"
 	"strconv"
@@ -456,6 +457,29 @@ func (h *Handler) readBody(parent, attempt context.Context, part contracts.Trans
 	return nil, fmt.Errorf("fetch source: %w", readErr)
 }
 
+// uploadRef returns a short hash of the multipart upload id and the part
+// number. The signed query string is not returned.
+func uploadRef(raw string) (id, part string) {
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return "", ""
+	}
+	query := parsed.Query()
+	part = query.Get("partNumber")
+	if part == "" {
+		part = query.Get("part_number")
+	}
+	uid := query.Get("uploadId")
+	if uid == "" {
+		uid = query.Get("upload_id")
+	}
+	if uid == "" {
+		return "", part
+	}
+	sum := sha256.Sum256([]byte(uid))
+	return hex.EncodeToString(sum[:4]), part
+}
+
 func (h *Handler) putPresigned(ctx context.Context, part contracts.TransferPart, body []byte) (partResult, error) {
 	sum := sha256.Sum256(body)
 	digest := hex.EncodeToString(sum[:])
@@ -525,14 +549,48 @@ func (h *Handler) putPresignedOnce(ctx context.Context, part contracts.TransferP
 	counter := &byteCounter{r: bytes.NewReader(body), onFirst: func() { traceFrom(ctx).moved(part.Index, "destination") }}
 	attemptCtx, cancel := context.WithCancelCause(ctx)
 	defer cancel(context.Canceled)
+	var held atomic.Value
+	var ackBytes atomic.Int64
+	var ackSeen atomic.Bool
+	var ackMoved atomic.Int64
+	var ackBase atomic.Int64
+	ackMoved.Store(time.Now().UnixNano())
+	uploadID, partNo := uploadRef(part.Destination.URL)
 	if allowReplace && int64(len(body)) >= hedgeMinBytes {
-		probe, budget, minBytes := putProbe, putBudget, hedgeMinBytes
-		go watchPutRate(attemptCtx, cancel, &counter.n, int64(len(body)), probe, budget, minBytes)
+		quiet := putAckQuiet
+		total := int64(len(body))
+		go watchPutAck(attemptCtx, cancel, &counter.n, total, quiet, func() (int64, bool) {
+			conn, _ := held.Load().(net.Conn)
+			if conn == nil {
+				return 0, false
+			}
+			n, ok := bytesAcked(conn)
+			if !ok {
+				return 0, false
+			}
+			if ackSeen.CompareAndSwap(false, true) {
+				ackBase.Store(n)
+				ackMoved.Store(time.Now().UnixNano())
+			} else if n != ackBytes.Load() {
+				ackMoved.Store(time.Now().UnixNano())
+			}
+			ackBytes.Store(n)
+			return n, true
+		}, func(written, acked int64) {
+			traceFrom(ctx).replaced(part.Index, "destination", "ack_stall", written, acked)
+		})
 	}
 	destinationRequest, err := http.NewRequestWithContext(attemptCtx, destinationMethod, part.Destination.URL, counter)
 	if err != nil {
 		return partResult{}, fmt.Errorf("create destination request: %w", err)
 	}
+	destinationRequest = destinationRequest.WithContext(httptrace.WithClientTrace(attemptCtx, &httptrace.ClientTrace{
+		GotConn: func(info httptrace.GotConnInfo) {
+			if info.Conn != nil {
+				held.Store(info.Conn)
+			}
+		},
+	}))
 	copyHeaders(destinationRequest.Header, part.Destination.Headers)
 	if destinationRequest.Header.Get("Content-Type") == "" {
 		destinationRequest.Header.Set("Content-Type", "application/octet-stream")
@@ -543,7 +601,18 @@ func (h *Handler) putPresignedOnce(ctx context.Context, part contracts.TransferP
 	if !counter.last.IsZero() {
 		respWait = time.Since(counter.last)
 	}
-	traceFrom(ctx).pace(part.Index, "destination", statusCode(destinationResponse), counter.n.Load(), time.Since(started), counter.blockedFor(), counter.longestGap(), respWait, counter.waitedInRead())
+	acked := int64(0)
+	if ackSeen.Load() {
+		acked = ackBytes.Load() - ackBase.Load()
+		if acked < 0 {
+			acked = 0
+		}
+	}
+	ackAge := time.Duration(0)
+	if ackSeen.Load() {
+		ackAge = time.Since(time.Unix(0, ackMoved.Load()))
+	}
+	traceFrom(ctx).pacePut(part.Index, statusCode(destinationResponse), counter.n.Load(), time.Since(started), counter.blockedFor(), counter.longestGap(), respWait, counter.waitedInRead(), acked, ackSeen.Load(), ackAge, uploadID, partNo)
 	if err != nil {
 		if ctx.Err() != nil {
 			return partResult{bytes: int64(len(body))}, ctx.Err()

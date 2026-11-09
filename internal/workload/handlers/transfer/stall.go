@@ -236,6 +236,41 @@ func (t *transferLog) pace(part int, side string, status int, n int64, dur, bloc
 		activeTransfers.Load())
 }
 
+// pacePut is the destination line plus TCP acknowledgement evidence.
+// acked is bytes_acked since the upload was first sampled. known is false
+// when the socket does not expose it. ackAge is how long that count has
+// been unchanged. upload is a short hash of the multipart upload id, and
+// partNo is the part number from the signed URL. The signed query is not logged.
+func (t *transferLog) pacePut(part int, status int, n int64, dur, blocked, maxGap, resp, readWait time.Duration, acked int64, known bool, ackAge time.Duration, upload, partNo string) {
+	if !known {
+		acked = -1
+		ackAge = 0
+	}
+	rate := 0.0
+	if dur > 0 && n > 0 {
+		rate = float64(n) / dur.Seconds() / (1024 * 1024)
+	}
+	ackRate := 0.0
+	if known && dur > 0 && acked > 0 {
+		ackRate = float64(acked) / dur.Seconds() / (1024 * 1024)
+	}
+	t.out("transfer pace workload=%s attempt=%s part=%d side=%s status=%d bytes=%d dur=%s rate_mib=%.2f blocked=%s max_gap=%s resp_wait=%s read_wait=%s acked=%d ack_mib=%.2f ack_age=%s upload=%s part_no=%s active=%d",
+		t.workload, t.attempt, part, "destination", status, n,
+		dur.Round(time.Millisecond), rate,
+		blocked.Round(time.Millisecond), maxGap.Round(time.Millisecond),
+		resp.Round(time.Millisecond), readWait.Round(time.Millisecond),
+		acked, ackRate, ackAge.Round(time.Millisecond), upload, partNo,
+		activeTransfers.Load())
+}
+
+func (t *transferLog) replaced(part int, side, reason string, written, acked int64) {
+	if t == nil {
+		return
+	}
+	t.out("transfer replace workload=%s attempt=%s part=%d side=%s reason=%s written=%d acked=%d active=%d",
+		t.workload, t.attempt, part, side, reason, written, acked, activeTransfers.Load())
+}
+
 type traceKey struct{}
 
 func withTrace(ctx context.Context, trace *transferLog) context.Context {

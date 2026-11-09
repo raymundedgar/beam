@@ -17,20 +17,22 @@ import (
 // 800ms, opened connections that had not sent a byte and slowed the whole wave.
 const maxSourceReplacements = 3
 
-// putReplacements is how many times a slow upload is sent again. The attempt
-// after that is left to finish.
-const putReplacements = 2
+// putReplacements is how many times an upload with frozen acknowledgements is
+// sent again. The 5:43 AM wave aborted twice, at about 4 MiB/s of bytes handed
+// to the kernel, and the third attempt then took 15 seconds. One replacement
+// is the hedge; the attempt after it is left to finish.
+const putReplacements = 1
 
 var (
 	hedgeAfter    = 1500 * time.Millisecond
 	sourceBudget  = 8 * time.Second
 	hedgeMinBytes = int64(1 << 20)
-	// putProbe is the first time an upload's average rate is judged.
-	// putBudget keeps a connection near 4–8 MiB/s. The copies that ran past
-	// 20 seconds stayed near 2 MiB/s, and a quiet-reader check closed uploads
-	// that were still draining a full send buffer.
-	putProbe  = 3 * time.Second
-	putBudget = 12 * time.Second
+	// putAckQuiet is how long TCP acknowledgements may sit still before that
+	// upload is sent again. Bytes queued in the send buffer are not progress.
+	// Dean and Barroso's hedged requests are for the tail, and they warn that
+	// a duplicate adds load when the first request is already well underway,
+	// so an upload that has already been acknowledged past halfway is kept.
+	putAckQuiet = 4 * time.Second
 )
 
 // errReplaced closes a download that cannot finish inside sourceBudget.
@@ -107,9 +109,63 @@ func watchSourceRate(ctx context.Context, cancel context.CancelCauseFunc, moved 
 	}
 }
 
-// watchPutRate cancels the upload when the bytes handed to the connection
-// cannot finish the object inside budget. The average is what matters: a
-// reader can pause while the kernel drains a full buffer on a healthy upload.
-func watchPutRate(ctx context.Context, cancel context.CancelCauseFunc, moved *atomic.Int64, total int64, probe, budget time.Duration, minBytes int64) {
-	watchSourceRate(ctx, cancel, moved, total, probe, budget, minBytes)
+// watchPutAck cancels an upload whose peer has stopped acknowledging data.
+// acked reports TCP bytes_acked. A missing sample is ignored, because judging
+// bytes handed to the kernel treats a full send buffer as a fast upload and
+// then discards it. Once half the object has been acknowledged, the attempt
+// is kept: restarting it costs more than finishing it.
+func watchPutAck(ctx context.Context, cancel context.CancelCauseFunc, written *atomic.Int64, total int64, quiet time.Duration, acked func() (int64, bool), onStall func(written, acked int64)) {
+	if cancel == nil || quiet <= 0 || acked == nil {
+		return
+	}
+	interval := quiet / 8
+	if interval > 500*time.Millisecond {
+		interval = 500 * time.Millisecond
+	}
+	if interval < time.Millisecond {
+		interval = time.Millisecond
+	}
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	var base int64
+	var last int64
+	var lastMove time.Time
+	haveBase := false
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case now := <-ticker.C:
+			if total > 0 && written.Load() >= total {
+				return
+			}
+			n, ok := acked()
+			if !ok {
+				continue
+			}
+			if !haveBase {
+				haveBase = true
+				base = n
+				last = n
+				lastMove = now
+				continue
+			}
+			if n != last {
+				last = n
+				lastMove = now
+				continue
+			}
+			if now.Sub(lastMove) < quiet {
+				continue
+			}
+			if total > 0 && n-base >= total/2 {
+				continue
+			}
+			if onStall != nil {
+				onStall(written.Load(), n-base)
+			}
+			cancel(errReplaced)
+			return
+		}
+	}
 }

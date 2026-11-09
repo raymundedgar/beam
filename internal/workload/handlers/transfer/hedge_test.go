@@ -144,11 +144,64 @@ func TestSlowSourceKeepsReplacingUntilAFastGet(t *testing.T) {
 	}
 }
 
+func TestPutAckStallReplacesAFrozenPeer(t *testing.T) {
+	ctx, cancel := context.WithCancelCause(context.Background())
+	var written atomic.Int64
+	written.Store(8 << 20)
+	go watchPutAck(ctx, cancel, &written, 50<<20, 40*time.Millisecond, func() (int64, bool) {
+		return 1000, true
+	}, nil)
+	select {
+	case <-ctx.Done():
+		if context.Cause(ctx) != errReplaced {
+			t.Fatalf("cause=%v", context.Cause(ctx))
+		}
+	case <-time.After(time.Second):
+		t.Fatal("frozen acknowledgements were kept")
+	}
+}
+
+func TestPutAckProgressAndHalfwayAreKept(t *testing.T) {
+	ctx, cancel := context.WithCancelCause(context.Background())
+	defer cancel(context.Canceled)
+	var written atomic.Int64
+	written.Store(8 << 20)
+	acked := int64(1000)
+	go watchPutAck(ctx, cancel, &written, 50<<20, 30*time.Millisecond, func() (int64, bool) {
+		acked += 1 << 20
+		return acked, true
+	}, nil)
+	select {
+	case <-ctx.Done():
+		if context.Cause(ctx) == errReplaced {
+			t.Fatal("replaced while acknowledgements moved")
+		}
+	case <-time.After(150 * time.Millisecond):
+	}
+
+	halfCtx, halfCancel := context.WithCancelCause(context.Background())
+	defer halfCancel(context.Canceled)
+	var samples atomic.Int32
+	go watchPutAck(halfCtx, halfCancel, &written, 50<<20, 30*time.Millisecond, func() (int64, bool) {
+		if samples.Add(1) == 1 {
+			return 1000, true
+		}
+		return 30 << 20, true
+	}, nil)
+	select {
+	case <-halfCtx.Done():
+		if context.Cause(halfCtx) == errReplaced {
+			t.Fatal("replaced after half the object was acknowledged")
+		}
+	case <-time.After(150 * time.Millisecond):
+	}
+}
+
 func TestSlowUploadIsReplaced(t *testing.T) {
 	withHedge(t, 2*time.Second, 8)
-	prevProbe, prevBudget := putProbe, putBudget
-	putProbe, putBudget = 60*time.Millisecond, 80*time.Millisecond
-	t.Cleanup(func() { putProbe, putBudget = prevProbe, prevBudget })
+	previous := putAckQuiet
+	putAckQuiet = 40 * time.Millisecond
+	t.Cleanup(func() { putAckQuiet = previous })
 	object := bytesRepeat(256 << 10)
 	var puts atomic.Int32
 	source := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
