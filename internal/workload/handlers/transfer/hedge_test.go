@@ -148,7 +148,7 @@ func TestPutAckStallReplacesAFrozenPeer(t *testing.T) {
 	ctx, cancel := context.WithCancelCause(context.Background())
 	var written atomic.Int64
 	written.Store(8 << 20)
-	go watchPutAck(ctx, cancel, &written, 50<<20, 40*time.Millisecond, func() (int64, bool) {
+	go watchPutAck(ctx, cancel, &written, 50<<20, 40*time.Millisecond, 3<<20, func() (int64, bool) {
 		return 1000, true
 	}, nil)
 	select {
@@ -167,7 +167,7 @@ func TestPutAckProgressAndHalfwayAreKept(t *testing.T) {
 	var written atomic.Int64
 	written.Store(8 << 20)
 	acked := int64(1000)
-	go watchPutAck(ctx, cancel, &written, 50<<20, 30*time.Millisecond, func() (int64, bool) {
+	go watchPutAck(ctx, cancel, &written, 50<<20, 30*time.Millisecond, 3<<20, func() (int64, bool) {
 		acked += 1 << 20
 		return acked, true
 	}, nil)
@@ -182,7 +182,7 @@ func TestPutAckProgressAndHalfwayAreKept(t *testing.T) {
 	halfCtx, halfCancel := context.WithCancelCause(context.Background())
 	defer halfCancel(context.Canceled)
 	var samples atomic.Int32
-	go watchPutAck(halfCtx, halfCancel, &written, 50<<20, 30*time.Millisecond, func() (int64, bool) {
+	go watchPutAck(halfCtx, halfCancel, &written, 50<<20, 30*time.Millisecond, 3<<20, func() (int64, bool) {
 		if samples.Add(1) == 1 {
 			return 1000, true
 		}
@@ -194,6 +194,26 @@ func TestPutAckProgressAndHalfwayAreKept(t *testing.T) {
 			t.Fatal("replaced after half the object was acknowledged")
 		}
 	case <-time.After(150 * time.Millisecond):
+	}
+}
+
+func TestSlowAckRateIsReplaced(t *testing.T) {
+	ctx, cancel := context.WithCancelCause(context.Background())
+	var written atomic.Int64
+	written.Store(8 << 20)
+	var n atomic.Int64
+	n.Store(1000)
+	go watchPutAck(ctx, cancel, &written, 50<<20, 30*time.Millisecond, 3<<20, func() (int64, bool) {
+		n.Add(1000)
+		return n.Load(), true
+	}, nil)
+	select {
+	case <-ctx.Done():
+		if context.Cause(ctx) != errReplaced {
+			t.Fatalf("cause=%v", context.Cause(ctx))
+		}
+	case <-time.After(time.Second):
+		t.Fatal("trickle of acknowledgements was kept")
 	}
 }
 

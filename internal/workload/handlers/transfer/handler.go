@@ -557,9 +557,9 @@ func (h *Handler) putPresignedOnce(ctx context.Context, part contracts.TransferP
 	ackMoved.Store(time.Now().UnixNano())
 	uploadID, partNo := uploadRef(part.Destination.URL)
 	if allowReplace && int64(len(body)) >= hedgeMinBytes {
-		quiet := putAckQuiet
+		quiet, minRate := putAckQuiet, putAckMinRate
 		total := int64(len(body))
-		go watchPutAck(attemptCtx, cancel, &counter.n, total, quiet, func() (int64, bool) {
+		go watchPutAck(attemptCtx, cancel, &counter.n, total, quiet, minRate, func() (int64, bool) {
 			conn, _ := held.Load().(net.Conn)
 			if conn == nil {
 				return 0, false

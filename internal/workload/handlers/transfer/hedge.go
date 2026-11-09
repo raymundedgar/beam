@@ -15,7 +15,8 @@ import (
 // maxSourceReplacements caps how many slow connections are discarded before
 // the last one is allowed to finish. Eight replacements per task, judged at
 // 800ms, opened connections that had not sent a byte and slowed the whole wave.
-const maxSourceReplacements = 3
+// The 6:43 AM wave died on the fourth download, still reading at 3–4 MiB/s.
+const maxSourceReplacements = 4
 
 // putReplacements is how many times an upload with frozen acknowledgements is
 // sent again. The 5:43 AM wave aborted twice, at about 4 MiB/s of bytes handed
@@ -27,12 +28,13 @@ var (
 	hedgeAfter    = 1500 * time.Millisecond
 	sourceBudget  = 8 * time.Second
 	hedgeMinBytes = int64(1 << 20)
-	// putAckQuiet is how long TCP acknowledgements may sit still before that
-	// upload is sent again. Bytes queued in the send buffer are not progress.
-	// Dean and Barroso's hedged requests are for the tail, and they warn that
-	// a duplicate adds load when the first request is already well underway,
-	// so an upload that has already been acknowledged past halfway is kept.
-	putAckQuiet = 4 * time.Second
+	// putAckQuiet is how long acknowledgements are observed before the rate is
+	// judged. putAckMinRate is the slowest acknowledged rate that is kept.
+	// The 6:43 AM uploads were not silent: they acknowledged at 0.5–2 MiB/s
+	// for the whole offer, while another upload in that wave finished in 2s.
+	// An upload already acknowledged past halfway is kept.
+	putAckQuiet   = 4 * time.Second
+	putAckMinRate = int64(3 << 20)
 )
 
 // errReplaced closes a download that cannot finish inside sourceBudget.
@@ -114,7 +116,7 @@ func watchSourceRate(ctx context.Context, cancel context.CancelCauseFunc, moved 
 // bytes handed to the kernel treats a full send buffer as a fast upload and
 // then discards it. Once half the object has been acknowledged, the attempt
 // is kept: restarting it costs more than finishing it.
-func watchPutAck(ctx context.Context, cancel context.CancelCauseFunc, written *atomic.Int64, total int64, quiet time.Duration, acked func() (int64, bool), onStall func(written, acked int64)) {
+func watchPutAck(ctx context.Context, cancel context.CancelCauseFunc, written *atomic.Int64, total int64, quiet time.Duration, minRate int64, acked func() (int64, bool), onStall func(written, acked int64)) {
 	if cancel == nil || quiet <= 0 || acked == nil {
 		return
 	}
@@ -128,8 +130,7 @@ func watchPutAck(ctx context.Context, cancel context.CancelCauseFunc, written *a
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	var base int64
-	var last int64
-	var lastMove time.Time
+	var baseAt time.Time
 	haveBase := false
 	for {
 		select {
@@ -146,26 +147,24 @@ func watchPutAck(ctx context.Context, cancel context.CancelCauseFunc, written *a
 			if !haveBase {
 				haveBase = true
 				base = n
-				last = n
-				lastMove = now
+				baseAt = now
 				continue
 			}
-			if n != last {
-				last = n
-				lastMove = now
+			progress := n - base
+			if total > 0 && progress >= total/2 {
 				continue
 			}
-			if now.Sub(lastMove) < quiet {
+			elapsed := now.Sub(baseAt)
+			if elapsed < quiet || elapsed <= 0 || progress >= total {
 				continue
 			}
-			if total > 0 && n-base >= total/2 {
-				continue
+			if minRate > 0 && float64(progress)/elapsed.Seconds() < float64(minRate) {
+				if onStall != nil {
+					onStall(written.Load(), progress)
+				}
+				cancel(errReplaced)
+				return
 			}
-			if onStall != nil {
-				onStall(written.Load(), n-base)
-			}
-			cancel(errReplaced)
-			return
 		}
 	}
 }
