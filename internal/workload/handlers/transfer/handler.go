@@ -556,10 +556,14 @@ func (h *Handler) putPresignedOnce(ctx context.Context, part contracts.TransferP
 	var ackBase atomic.Int64
 	ackMoved.Store(time.Now().UnixNano())
 	uploadID, partNo := uploadRef(part.Destination.URL)
-	if allowReplace && int64(len(body)) >= hedgeMinBytes {
+	if int64(len(body)) >= hedgeMinBytes {
 		quiet, minRate := putAckQuiet, putAckMinRate
 		total := int64(len(body))
-		go watchPutAck(attemptCtx, cancel, &counter.n, total, quiet, minRate, func() (int64, bool) {
+		var stallCancel context.CancelCauseFunc
+		if allowReplace {
+			stallCancel = cancel
+		}
+		go watchPutAck(attemptCtx, stallCancel, &counter.n, total, quiet, minRate, func() (int64, bool) {
 			conn, _ := held.Load().(net.Conn)
 			if conn == nil {
 				return 0, false
