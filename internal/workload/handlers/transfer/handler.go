@@ -494,12 +494,88 @@ func (h *Handler) putPresigned(ctx context.Context, part contracts.TransferPart,
 	defer h.releaseUpload()
 	replaced := 0
 	return h.retryPresigned(ctx, func() (partResult, error) {
-		result, err := h.putPresignedOnce(ctx, part, body, digest, replaceSlowUpload(ctx, replaced))
+		allow := replaceSlowUpload(ctx, replaced)
+		// A second upload is opened only when the first is still below the
+		// acknowledgement floor halfway through the probe, and only while two
+		// discards remain. Fast uploads never open it. The last attempt stays
+		// single so a path that is slow on every socket still delivers.
+		if allow && int64(len(body)) >= hedgeMinBytes && replaceSlowUpload(ctx, replaced+1) {
+			result, err, used := h.putPresignedHedged(ctx, part, body, digest)
+			replaced += used
+			return result, err
+		}
+		result, err := h.putPresignedOnce(ctx, part, body, digest, allow, nil)
 		if errors.Is(err, errReplaced) {
 			replaced++
 		}
 		return result, err
 	})
+}
+
+// putPresignedHedged starts one upload and, if it has not acknowledged at the
+// minimum rate by half the probe, starts a second with the same bytes. Either
+// acceptance cancels the other. A discard from the slow socket does not cancel
+// the one that is still running. used counts connections that were discarded.
+func (h *Handler) putPresignedHedged(ctx context.Context, part contracts.TransferPart, body []byte, digest string) (partResult, error, int) {
+	attemptCtx, cancel := context.WithCancelCause(ctx)
+	defer cancel(context.Canceled)
+	type outcome struct {
+		result partResult
+		err    error
+	}
+	ch := make(chan outcome, 2)
+	var progress atomic.Int64
+	go func() {
+		result, err := h.putPresignedOnce(attemptCtx, part, body, digest, true, &progress)
+		ch <- outcome{result, err}
+	}()
+	hedgeAt := putAckQuiet / 2
+	if hedgeAt < time.Millisecond {
+		hedgeAt = time.Millisecond
+	}
+	timer := time.NewTimer(hedgeAt)
+	defer timer.Stop()
+	pending := 1
+	spare := false
+	replaced := 0
+	var last partResult
+	var lastErr error
+	for pending > 0 {
+		select {
+		case <-ctx.Done():
+			return last, ctx.Err(), replaced
+		case <-timer.C:
+			if spare {
+				continue
+			}
+			spare = true
+			// No sample yet stays at zero. A socket that has already passed
+			// the floor does not need a spare.
+			if progress.Load() >= putAckMinRate*int64(hedgeAt)/int64(time.Second) {
+				continue
+			}
+			pending++
+			go func() {
+				result, err := h.putPresignedOnce(attemptCtx, part, body, digest, true, nil)
+				ch <- outcome{result, err}
+			}()
+		case o := <-ch:
+			pending--
+			if o.err == nil {
+				cancel(errReplaced)
+				return o.result, nil, replaced
+			}
+			if errors.Is(o.err, errReplaced) {
+				replaced++
+				if lastErr == nil {
+					last, lastErr = o.result, o.err
+				}
+				continue
+			}
+			last, lastErr = o.result, o.err
+		}
+	}
+	return last, lastErr, replaced
 }
 
 // retryPresigned repeats a presigned attempt. HTTP 408, 429, and 5xx stop after
@@ -540,7 +616,7 @@ func (h *Handler) retryPresigned(ctx context.Context, attemptFn func() (partResu
 	}
 }
 
-func (h *Handler) putPresignedOnce(ctx context.Context, part contracts.TransferPart, body []byte, digest string, allowReplace bool) (partResult, error) {
+func (h *Handler) putPresignedOnce(ctx context.Context, part contracts.TransferPart, body []byte, digest string, allowReplace bool, progress *atomic.Int64) (partResult, error) {
 	destinationMethod := strings.ToUpper(strings.TrimSpace(part.Destination.Method))
 	if destinationMethod == "" {
 		destinationMethod = http.MethodPut
@@ -579,6 +655,13 @@ func (h *Handler) putPresignedOnce(ctx context.Context, part contracts.TransferP
 				ackMoved.Store(time.Now().UnixNano())
 			}
 			ackBytes.Store(n)
+			if progress != nil {
+				delta := n - ackBase.Load()
+				if delta < 0 {
+					delta = 0
+				}
+				progress.Store(delta)
+			}
 			return n, true
 		}, func(written, acked int64) {
 			traceFrom(ctx).replaced(part.Index, "destination", "ack_stall", written, acked)

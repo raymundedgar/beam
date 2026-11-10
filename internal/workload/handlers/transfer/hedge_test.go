@@ -324,6 +324,53 @@ func TestSlowAckRateIsReplaced(t *testing.T) {
 	}
 }
 
+func TestUploadHedgeKeepsTheFasterConnection(t *testing.T) {
+	withHedge(t, 2*time.Second, 1<<20)
+	previous := putAckQuiet
+	putAckQuiet = 400 * time.Millisecond
+	t.Cleanup(func() { putAckQuiet = previous })
+	object := bytesRepeat(2 << 20)
+	var started atomic.Int32
+	source := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write(object)
+	}))
+	t.Cleanup(source.Close)
+	dest := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if started.Add(1) == 1 {
+			// Longer than the probe. A serial upload would wait this out.
+			// The body is drained afterwards so the test server can close.
+			time.Sleep(putAckQuiet + 200*time.Millisecond)
+			_, _ = io.Copy(io.Discard, r.Body)
+			return
+		}
+		body, _ := io.ReadAll(r.Body)
+		if len(body) != len(object) {
+			t.Errorf("destination length=%d", len(body))
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(dest.Close)
+	handler := retryingHandler()
+	handler.client = smallSendBufferClient(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	startedAt := time.Now()
+	result, err := handler.Execute(ctx, presignedSpec(t, source.URL, dest.URL, int64(len(object))))
+	elapsed := time.Since(startedAt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.BytesProcessed != int64(len(object)) {
+		t.Fatalf("bytes=%d", result.BytesProcessed)
+	}
+	if elapsed >= putAckQuiet {
+		t.Fatalf("waited %s for the slow socket before using the fast one", elapsed.Round(time.Millisecond))
+	}
+	if started.Load() < 2 {
+		t.Fatalf("puts=%d", started.Load())
+	}
+}
+
 func TestSlowUploadIsReplaced(t *testing.T) {
 	withHedge(t, 2*time.Second, 8)
 	previous := putAckQuiet
