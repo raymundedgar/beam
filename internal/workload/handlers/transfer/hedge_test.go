@@ -250,6 +250,25 @@ func TestFrozenTailAfterTheBufferFillsIsReplaced(t *testing.T) {
 	}
 }
 
+func TestReplaceSlowUploadStopsNearTheDeadline(t *testing.T) {
+	if !replaceSlowUpload(context.Background(), 0) {
+		t.Fatal("a slow upload with no deadline was kept")
+	}
+	if replaceSlowUpload(context.Background(), putReplacements) {
+		t.Fatal("replaced past the cap")
+	}
+	tight, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if replaceSlowUpload(tight, 0) {
+		t.Fatal("discarded a connection that could not be restarted in time")
+	}
+	wide, wideCancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer wideCancel()
+	if !replaceSlowUpload(wide, 0) {
+		t.Fatal("kept a slow upload that still had time for a new connection")
+	}
+}
+
 func TestSlowAckRateIsReplaced(t *testing.T) {
 	ctx, cancel := context.WithCancelCause(context.Background())
 	var written atomic.Int64

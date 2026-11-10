@@ -19,11 +19,12 @@ import (
 // 1–2 MiB/s, while other tasks in that wave finished a download at 26–45.
 const maxSourceReplacements = 5
 
-// putReplacements is how many times an upload with slow acknowledgements is
-// sent again. The attempt after that is left to finish. The 10:43 wave's one
-// retry acknowledged about 2 MB and then did not move for 22 seconds, while
-// the other uploads in that wave finished in about 2 seconds.
-const putReplacements = 2
+// putReplacements caps how many times a slow upload is discarded. The signed
+// request is repeated from the start on a new connection. The cap stops a
+// path that is slow every time from restarting until the offer ends with
+// nothing delivered. The 10:43 wave's single retry acknowledged about 2 MB
+// and then did not move for 22 seconds.
+const putReplacements = 4
 
 var (
 	hedgeAfter    = 1500 * time.Millisecond
@@ -120,6 +121,21 @@ const putAckKeep = 16 << 20
 
 func pastHalfway(moved, total int64) bool {
 	return total > 0 && moved*2 >= total
+}
+
+// replaceSlowUpload reports whether a slow upload should be discarded for a
+// new connection. A restart needs the probe interval plus time for a fast
+// copy. Inside that window the current connection is kept so the bytes
+// already sent are not thrown away.
+func replaceSlowUpload(ctx context.Context, replaced int) bool {
+	if replaced >= putReplacements {
+		return false
+	}
+	deadline, ok := ctx.Deadline()
+	if !ok {
+		return true
+	}
+	return time.Until(deadline) >= putAckQuiet+2*time.Second
 }
 
 // watchPutAck cancels an upload whose acknowledgements cannot finish the

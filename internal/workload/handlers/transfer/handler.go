@@ -494,7 +494,7 @@ func (h *Handler) putPresigned(ctx context.Context, part contracts.TransferPart,
 	defer h.releaseUpload()
 	replaced := 0
 	return h.retryPresigned(ctx, func() (partResult, error) {
-		result, err := h.putPresignedOnce(ctx, part, body, digest, replaced < putReplacements)
+		result, err := h.putPresignedOnce(ctx, part, body, digest, replaceSlowUpload(ctx, replaced))
 		if errors.Is(err, errReplaced) {
 			replaced++
 		}
