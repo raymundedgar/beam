@@ -17,7 +17,7 @@ TOKEN=$(cat data/orchestrator/control-token)
 mkdir -p data/analytics
 
 python3 - "$MODE" "$TOKEN" <<'PY'
-import ipaddress, json, os, re, subprocess, sys, time, urllib.error, urllib.parse, urllib.request
+import hashlib, ipaddress, json, os, re, subprocess, sys, time, urllib.error, urllib.parse, urllib.request
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 
@@ -214,6 +214,81 @@ def collect_providers(task):
     walk(payload, "source")
     return sources, dests
 
+REGIONS = {"wnam", "enam", "sam", "weur", "eeur", "apac", "oc", "afr", "me"}
+
+def clean_region(value):
+    if not isinstance(value, str):
+        return ""
+    value = value.strip().lower()
+    return value if value in REGIONS else ""
+
+def regions_of(task):
+    payload = payload_of(task)
+    sources, dests = [], []
+
+    def add(bucket, value):
+        label = clean_region(value)
+        if label and label not in bucket:
+            bucket.append(label)
+
+    parts = payload.get("parts")
+    if isinstance(parts, list):
+        for part in parts:
+            if not isinstance(part, dict):
+                continue
+            source = part.get("source") if isinstance(part.get("source"), dict) else {}
+            dest = part.get("destination") if isinstance(part.get("destination"), dict) else {}
+            add(sources, source.get("region"))
+            add(dests, dest.get("region"))
+    source = payload.get("source")
+    if isinstance(source, dict):
+        add(sources, source.get("region"))
+    for key in ("targets", "destinations"):
+        items = payload.get(key)
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if isinstance(item, dict):
+                add(dests, item.get("region"))
+    src = "+".join(sources)
+    dst = "+".join(dests)
+    if src and dst:
+        return src if src == dst else f"{src}>{dst}"
+    return src or dst or "—"
+
+def upload_of(task):
+    payload = payload_of(task)
+    found = []
+
+    def add(url):
+        if not isinstance(url, str) or "upload" not in url.lower():
+            return
+        try:
+            query = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
+        except ValueError:
+            return
+        uid = (query.get("uploadId") or query.get("upload_id") or [""])[0]
+        if not uid:
+            return
+        short = hashlib.sha256(uid.encode()).hexdigest()[:8]
+        if short not in found:
+            found.append(short)
+
+    parts = payload.get("parts")
+    if isinstance(parts, list):
+        for part in parts:
+            if isinstance(part, dict):
+                dest = part.get("destination") if isinstance(part.get("destination"), dict) else {}
+                add(dest.get("url"))
+    for key in ("destinations", "targets"):
+        items = payload.get(key)
+        if not isinstance(items, list):
+            continue
+        for item in items:
+            if isinstance(item, dict):
+                add(item.get("url") or (item.get("endpoint") or {}).get("url") if isinstance(item.get("endpoint"), dict) else item.get("url"))
+    return "+".join(found) if found else "—"
+
 def kind_of(task):
     base = ((task.get("spec") or {}).get("kind") or "-")
     sources, dests = collect_providers(task)
@@ -252,6 +327,8 @@ def enrich(task, medians):
         "in_flight": state in IN_FLIGHT,
         "id": (task.get("external_id") or "")[:10],
         "stop": stop_reason(task),
+        "region": regions_of(task),
+        "upload": upload_of(task),
     }
 
 def medians_of(rows):
@@ -349,14 +426,16 @@ def write_unsuccessful(tasks):
         lines.append("None right now.")
     else:
         lines += [
-            "| KIND | STATE | CREATED | UPDATED | STOP | REASON |",
-            "| --- | --- | --- | --- | --- | --- |",
+            "| KIND | STATE | REGION | UPLOAD | CREATED | UPDATED | STOP | REASON |",
+            "| --- | --- | --- | --- | --- | --- | --- | --- |",
         ]
         for task in sorted(bad, key=lambda item: item.get("updated_at") or "", reverse=True):
             lines.append(
-                "| {kind} | {state} | {created} | {updated} | {stop} | {reason} |".format(
+                "| {kind} | {state} | {region} | {upload} | {created} | {updated} | {stop} | {reason} |".format(
                     kind=kind_of(task),
                     state=task.get("state") or "-",
+                    region=regions_of(task),
+                    upload=upload_of(task),
                     created=local_clock(parse_time(task.get("created_at"))),
                     updated=local_clock(parse_time(task.get("updated_at"))),
                     stop=stop_reason(task) or "—",
@@ -395,13 +474,14 @@ def print_rows(rows):
         return
     print(
         f"  {'KIND':<32} {'STATE':<10} {'SIZE':>10} {'TIME':>8} {'RATE':>10}  "
-        f"{'STOP':<18} {'START':<12} {'END'}"
+        f"{'REGION':<14} {'UPLOAD':<10} {'STOP':<18} {'START':<12} {'END'}"
     )
-    print("  " + "-" * 116)
+    print("  " + "-" * 142)
     for row in rows:
         line = (
             f"  {row['kind']:<32} {row['state']:<10} {fmt_mib(row['bytes']):>10} "
             f"{fmt_secs(row['seconds']):>8} {fmt_rate(row['mib_s']):>10}  "
+            f"{(row.get('region') or '—'):<14} {(row.get('upload') or '—'):<10} "
             f"{(row.get('stop') or '—'):<18} {local_clock(row.get('started')):<12} "
             f"{local_clock(row.get('ended'))}"
         )
