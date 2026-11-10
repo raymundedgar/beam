@@ -15,9 +15,9 @@ import (
 // maxSourceReplacements caps how many slow connections are discarded before
 // the last one is allowed to finish. Eight replacements per task, judged at
 // 800ms, opened connections that had not sent a byte and slowed the whole wave.
-// The 8:43 AM wave was cancelled on the fifth download, still reading at
-// 1–2 MiB/s, while other tasks in that wave finished a download at 26–45.
-const maxSourceReplacements = 5
+// The 12:37 AM wave was cancelled on the sixth download, still reading at
+// 0.5–2 MiB/s, while other tasks in that wave finished a download at 14–39.
+const maxSourceReplacements = 6
 
 // putReplacements caps how many times a slow upload is discarded. The signed
 // request is repeated from the start on a new connection. The cap stops a
