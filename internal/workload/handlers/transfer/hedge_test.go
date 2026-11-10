@@ -199,14 +199,27 @@ func TestPutAckProgressAndHalfwayAreKept(t *testing.T) {
 
 func TestSourcePastHalfwayIsKept(t *testing.T) {
 	ctx, cancel := context.WithCancelCause(context.Background())
-	defer cancel(context.Canceled)
 	var moved atomic.Int64
 	moved.Store(30 << 20)
 	go watchSourceRate(ctx, cancel, &moved, 50<<20, 20*time.Millisecond, time.Millisecond, 8)
 	select {
 	case <-ctx.Done():
-		if context.Cause(ctx) == errReplaced {
-			t.Fatal("replaced a download that already held half the object")
+		if context.Cause(ctx) != errReplaced {
+			t.Fatalf("cause=%v", context.Cause(ctx))
+		}
+	case <-time.After(time.Second):
+		t.Fatal("a download at 60 percent was kept")
+	}
+
+	kept, stop := context.WithCancelCause(context.Background())
+	defer stop(context.Canceled)
+	var almost atomic.Int64
+	almost.Store(42 << 20)
+	go watchSourceRate(kept, stop, &almost, 50<<20, 20*time.Millisecond, time.Millisecond, 8)
+	select {
+	case <-kept.Done():
+		if context.Cause(kept) == errReplaced {
+			t.Fatal("replaced a download that already held 80 percent")
 		}
 	case <-time.After(120 * time.Millisecond):
 	}

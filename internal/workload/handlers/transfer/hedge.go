@@ -22,9 +22,9 @@ const maxSourceReplacements = 6
 // putReplacements caps how many times a slow upload is discarded. The signed
 // request is repeated from the start on a new connection. The cap stops a
 // path that is slow every time from restarting until the offer ends with
-// nothing delivered. The 10:43 wave's single retry acknowledged about 2 MB
-// and then did not move for 22 seconds.
-const putReplacements = 4
+// nothing delivered. The 12:43 AM wave used all four discards, and the upload
+// that remained was still frozen for 14 seconds.
+const putReplacements = 5
 
 var (
 	hedgeAfter    = 1500 * time.Millisecond
@@ -64,8 +64,7 @@ func rateTooSlow(moved, total int64, elapsed, budget time.Duration, minBytes int
 
 // watchSourceRate cancels the download when its average rate can no longer
 // finish inside budget. The check repeats, so a burst followed by a crawl is
-// not kept. A download that already holds half the object is kept: the 7:43
-// wave dropped one at 41 MB of 49 MB, and the replacement took 13 seconds.
+// not kept. A download that already holds about 80% of the object is kept.
 func watchSourceRate(ctx context.Context, cancel context.CancelCauseFunc, moved *atomic.Int64, total int64, probe, budget time.Duration, minBytes int64) {
 	if cancel == nil || probe <= 0 {
 		return
@@ -81,7 +80,7 @@ func watchSourceRate(ctx context.Context, cancel context.CancelCauseFunc, moved 
 		return
 	case <-timer.C:
 	}
-	if !pastHalfway(moved.Load(), total) && moved.Load() > 0 && rateTooSlow(moved.Load(), total, early, budget*2, minBytes) {
+	if !mostlyReceived(moved.Load(), total) && moved.Load() > 0 && rateTooSlow(moved.Load(), total, early, budget*2, minBytes) {
 		cancel(errReplaced)
 		return
 	}
@@ -102,7 +101,7 @@ func watchSourceRate(ctx context.Context, cancel context.CancelCauseFunc, moved 
 	defer ticker.Stop()
 	started := time.Now().Add(-probe)
 	for {
-		if !pastHalfway(moved.Load(), total) && rateTooSlow(moved.Load(), total, time.Since(started), budget, minBytes) {
+		if !mostlyReceived(moved.Load(), total) && rateTooSlow(moved.Load(), total, time.Since(started), budget, minBytes) {
 			cancel(errReplaced)
 			return
 		}
@@ -121,6 +120,14 @@ const putAckKeep = 16 << 20
 
 func pastHalfway(moved, total int64) bool {
 	return total > 0 && moved*2 >= total
+}
+
+// mostlyReceived is the download keep line. Half of a 50 MB object at 3 MiB/s
+// still has about 8 seconds left, and the 12:43 AM wave kept those reads for
+// 14–16 seconds. Another download from the same region finished at 33 MiB/s.
+// Eighty percent still keeps the 7:43 case that was already at 41 MB of 49.
+func mostlyReceived(moved, total int64) bool {
+	return total > 0 && moved*5 >= total*4
 }
 
 // replaceSlowUpload reports whether a slow upload should be discarded for a
