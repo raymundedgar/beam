@@ -212,6 +212,44 @@ func TestSourcePastHalfwayIsKept(t *testing.T) {
 	}
 }
 
+func TestFrozenTailAfterTheBufferFillsIsReplaced(t *testing.T) {
+	ctx, cancel := context.WithCancelCause(context.Background())
+	var written atomic.Int64
+	written.Store(50 << 20)
+	var calls atomic.Int32
+	go watchPutAck(ctx, cancel, &written, 50<<20, 40*time.Millisecond, 3<<20, func() (int64, bool) {
+		if calls.Add(1) == 1 {
+			return 1000, true
+		}
+		return 20 << 20, true
+	}, nil)
+	select {
+	case <-ctx.Done():
+		if context.Cause(ctx) != errReplaced {
+			t.Fatalf("cause=%v", context.Cause(ctx))
+		}
+	case <-time.After(time.Second):
+		t.Fatal("a full buffer with frozen acknowledgements was kept")
+	}
+
+	doneCtx, doneCancel := context.WithCancelCause(context.Background())
+	defer doneCancel(context.Canceled)
+	var samples atomic.Int32
+	go watchPutAck(doneCtx, doneCancel, &written, 50<<20, 40*time.Millisecond, 3<<20, func() (int64, bool) {
+		if samples.Add(1) == 1 {
+			return 1000, true
+		}
+		return (50 << 20) + 1000, true
+	}, nil)
+	select {
+	case <-doneCtx.Done():
+		if context.Cause(doneCtx) == errReplaced {
+			t.Fatal("replaced an upload whose body was already acknowledged")
+		}
+	case <-time.After(150 * time.Millisecond):
+	}
+}
+
 func TestSlowAckRateIsReplaced(t *testing.T) {
 	ctx, cancel := context.WithCancelCause(context.Background())
 	var written atomic.Int64

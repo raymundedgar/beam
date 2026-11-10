@@ -19,11 +19,11 @@ import (
 // 1–2 MiB/s, while other tasks in that wave finished a download at 26–45.
 const maxSourceReplacements = 5
 
-// putReplacements is how many times an upload with frozen acknowledgements is
-// sent again. The 5:43 AM wave aborted twice, at about 4 MiB/s of bytes handed
-// to the kernel, and the third attempt then took 15 seconds. One replacement
-// is the hedge; the attempt after it is left to finish.
-const putReplacements = 1
+// putReplacements is how many times an upload with slow acknowledgements is
+// sent again. The attempt after that is left to finish. The 10:43 wave's one
+// retry acknowledged about 2 MB and then did not move for 22 seconds, while
+// the other uploads in that wave finished in about 2 seconds.
+const putReplacements = 2
 
 var (
 	hedgeAfter    = 1500 * time.Millisecond
@@ -140,27 +140,44 @@ func watchPutAck(ctx context.Context, cancel context.CancelCauseFunc, written *a
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	var base int64
+	var last int64
 	var baseAt time.Time
+	var lastMove time.Time
 	haveBase := false
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case now := <-ticker.C:
-			if total > 0 && written.Load() >= total {
-				return
-			}
 			n, ok := acked()
 			if !ok {
 				continue
 			}
 			if !haveBase {
 				haveBase = true
-				base = n
-				baseAt = now
+				base, last = n, n
+				baseAt, lastMove = now, now
 				continue
 			}
+			if n != last {
+				last = n
+				lastMove = now
+			}
 			progress := n - base
+			// The body can sit fully queued in a 16 MB window while the peer
+			// has stopped acknowledging. The 9:43 upload reached 32 MB
+			// acknowledged, then the remainder did not move for 18 seconds.
+			// Watching used to stop once the buffer was full.
+			frozen := now.Sub(lastMove) >= quiet
+			if frozen && total > 0 && written.Load() >= total && progress+(1<<20) < total {
+				if onStall != nil {
+					onStall(written.Load(), progress)
+				}
+				if cancel != nil {
+					cancel(errReplaced)
+				}
+				return
+			}
 			if progress >= putAckKeep || pastHalfway(progress, total) {
 				continue
 			}
