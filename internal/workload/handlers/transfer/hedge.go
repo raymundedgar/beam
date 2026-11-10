@@ -118,6 +118,14 @@ func watchSourceRate(ctx context.Context, cancel context.CancelCauseFunc, moved 
 // new connection then took 19 seconds.
 const putAckKeep = 16 << 20
 
+// putAckTailFactor is how much longer a proven upload may sit quiet before
+// its last unacknowledged window is discarded. Two seconds is enough to drop
+// a socket that has barely started. The same two seconds also discarded
+// connections that had already acknowledged about 30 MB at 8 MiB/s; the
+// replacements then took 33 seconds. A proven upload has to be quiet for
+// four probe intervals, which is 8 seconds at the production probe.
+const putAckTailFactor = 4
+
 func pastHalfway(moved, total int64) bool {
 	return total > 0 && moved*2 >= total
 }
@@ -190,9 +198,16 @@ func watchPutAck(ctx context.Context, cancel context.CancelCauseFunc, written *a
 			// The body can sit fully queued in a 16 MB window while the peer
 			// has stopped acknowledging. The 9:43 upload reached 32 MB
 			// acknowledged, then the remainder did not move for 18 seconds.
-			// Watching used to stop once the buffer was full.
-			frozen := now.Sub(lastMove) >= quiet
-			if frozen && total > 0 && written.Load() >= total && progress+(1<<20) < total {
+			// Watching used to stop once the buffer was full. A connection
+			// that has already passed the keep line is allowed a longer pause:
+			// the 4:37 wave threw away 30 MB acknowledged at 8 MiB/s after a
+			// two second gap, and the new sockets were slower.
+			silence := now.Sub(lastMove)
+			tailQuiet := quiet
+			if progress >= putAckKeep || pastHalfway(progress, total) {
+				tailQuiet = quiet * putAckTailFactor
+			}
+			if silence >= tailQuiet && total > 0 && written.Load() >= total && progress+(1<<20) < total {
 				if onStall != nil {
 					onStall(written.Load(), progress)
 				}

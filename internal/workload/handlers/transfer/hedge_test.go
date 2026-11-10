@@ -263,6 +263,28 @@ func TestFrozenTailAfterTheBufferFillsIsReplaced(t *testing.T) {
 	}
 }
 
+func TestProvenUploadSurvivesAShortTailPause(t *testing.T) {
+	ctx, cancel := context.WithCancelCause(context.Background())
+	defer cancel(context.Canceled)
+	var written atomic.Int64
+	written.Store(50 << 20)
+	quiet := 40 * time.Millisecond
+	var calls atomic.Int32
+	go watchPutAck(ctx, cancel, &written, 50<<20, quiet, 3<<20, func() (int64, bool) {
+		if calls.Add(1) == 1 {
+			return 1000, true
+		}
+		return 30 << 20, true
+	}, nil)
+	select {
+	case <-ctx.Done():
+		if context.Cause(ctx) == errReplaced {
+			t.Fatal("replaced a proven upload during a short acknowledgement pause")
+		}
+	case <-time.After(quiet * 2):
+	}
+}
+
 func TestReplaceSlowUploadStopsNearTheDeadline(t *testing.T) {
 	if !replaceSlowUpload(context.Background(), 0) {
 		t.Fatal("a slow upload with no deadline was kept")
