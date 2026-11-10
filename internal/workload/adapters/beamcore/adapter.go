@@ -66,6 +66,13 @@ type OfferDestination struct {
 	Region       *string                  `json:"region,omitempty"`
 }
 
+func regionString(region *string) string {
+	if region == nil {
+		return ""
+	}
+	return strings.TrimSpace(*region)
+}
+
 func MultipartTransferResources() domain.Resources {
 	return domain.Resources{MemoryBytes: 4 << 20, BandwidthMbps: 1, Connections: 2, Streams: 2}
 }
@@ -126,9 +133,10 @@ func transferWorkload(offer TaskOffer, assignmentTimeout time.Duration, received
 		etagRequired = etagRequired || destination.ETagRequired
 		part := contracts.TransferPart{
 			Index: index, Length: offer.Source.ChunkSize, ETagRequired: destination.ETagRequired,
-			Source: contracts.HTTPEndpoint{URL: offer.Source.URL, Headers: offer.Source.Headers},
+			Source: contracts.HTTPEndpoint{URL: offer.Source.URL, Headers: offer.Source.Headers,
+				Region: regionString(offer.Source.Region)},
 			Destination: contracts.HTTPEndpoint{URL: destination.URL, Method: method,
-				Headers: destination.Headers},
+				Headers: destination.Headers, Region: regionString(destination.Region)},
 		}
 		if destination.Protocol != "" && destination.Protocol != contracts.UploadProtocolPresignedPut {
 			part.Protocol, part.Profile, part.MaxAttempts = destination.Protocol, destination.Profile, destination.MaxAttempts

@@ -424,7 +424,7 @@ func (h *Handler) readSourceOnce(ctx context.Context, part contracts.TransferPar
 func (h *Handler) readBody(parent, attempt context.Context, part contracts.TransferPart, counter *byteCounter, started time.Time) ([]byte, error) {
 	response, err := h.openSourceFrom(attempt, part, 0, "")
 	if err != nil {
-		traceFrom(parent).pace(part.Index, "source", 0, counter.n.Load(), time.Since(started), counter.blockedFor(), counter.longestGap(), 0, counter.waitedInRead())
+		traceFrom(parent).pace(part.Index, "source", 0, counter.n.Load(), time.Since(started), counter.blockedFor(), counter.longestGap(), 0, counter.waitedInRead(), part.Source.Region)
 		if parent.Err() != nil {
 			return nil, parent.Err()
 		}
@@ -440,7 +440,7 @@ func (h *Handler) readBody(parent, attempt context.Context, part contracts.Trans
 	chunk := make([]byte, part.Length)
 	n, readErr := io.ReadFull(counter, chunk)
 	body := chunk[:n]
-	traceFrom(parent).pace(part.Index, "source", response.StatusCode, int64(len(body)), time.Since(started), counter.blockedFor(), counter.longestGap(), respWait, counter.waitedInRead())
+	traceFrom(parent).pace(part.Index, "source", response.StatusCode, int64(len(body)), time.Since(started), counter.blockedFor(), counter.longestGap(), respWait, counter.waitedInRead(), part.Source.Region)
 	if int64(len(body)) == part.Length {
 		return body, nil
 	}
@@ -616,7 +616,7 @@ func (h *Handler) putPresignedOnce(ctx context.Context, part contracts.TransferP
 	if ackSeen.Load() {
 		ackAge = time.Since(time.Unix(0, ackMoved.Load()))
 	}
-	traceFrom(ctx).pacePut(part.Index, statusCode(destinationResponse), counter.n.Load(), time.Since(started), counter.blockedFor(), counter.longestGap(), respWait, counter.waitedInRead(), acked, ackSeen.Load(), ackAge, uploadID, partNo)
+	traceFrom(ctx).pacePut(part.Index, statusCode(destinationResponse), counter.n.Load(), time.Since(started), counter.blockedFor(), counter.longestGap(), respWait, counter.waitedInRead(), acked, ackSeen.Load(), ackAge, uploadID, partNo, part.Destination.Region)
 	if err != nil {
 		if ctx.Err() != nil {
 			return partResult{bytes: int64(len(body))}, ctx.Err()
@@ -699,7 +699,7 @@ func (h *Handler) executePresignedPart(ctx context.Context, part contracts.Trans
 	destinationResponse, err := h.client.Do(destinationRequest)
 	// This path copies the source into the destination in one request. blocked is
 	// time the upload stopped pulling bytes; read_wait is time spent reading the source.
-	traceFrom(ctx).pace(part.Index, "stream", statusCode(destinationResponse), sourceCounter.n.Load(), time.Since(started), sourceCounter.blockedFor(), sourceCounter.longestGap(), 0, sourceCounter.waitedInRead())
+	traceFrom(ctx).pace(part.Index, "stream", statusCode(destinationResponse), sourceCounter.n.Load(), time.Since(started), sourceCounter.blockedFor(), sourceCounter.longestGap(), 0, sourceCounter.waitedInRead(), part.Destination.Region)
 	if err != nil {
 		if ctx.Err() != nil {
 			return partResult{bytes: counter.count}, ctx.Err()

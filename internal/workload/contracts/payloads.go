@@ -4,6 +4,8 @@ type HTTPEndpoint struct {
 	URL     string            `json:"url"`
 	Method  string            `json:"method,omitempty"`
 	Headers map[string]string `json:"headers,omitempty"`
+	// Region is the storage's broad region (wnam, enam, sam, weur, eeur, apac, oc, afr, me), or empty when unknown.
+	Region string `json:"region,omitempty"`
 }
 
 // Destination upload protocols. An empty protocol is UploadProtocolPresignedPut.

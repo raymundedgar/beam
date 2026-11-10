@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"log"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -216,24 +217,37 @@ func (t *transferLog) partDone(part int, bytes int64) {
 	dur := time.Since(t.started)
 	t.out("transfer part_done workload=%s attempt=%s part=%d bytes=%d after=%s",
 		t.workload, t.attempt, part, bytes, dur.Round(time.Millisecond))
-	t.pace(part, "total", 0, bytes, dur, 0, 0, 0, 0)
+	t.pace(part, "total", 0, bytes, dur, 0, 0, 0, 0, "-")
+}
+
+func regionLabel(region string) string {
+	region = strings.TrimSpace(strings.ToLower(region))
+	if region == "" || len(region) > 8 {
+		return "-"
+	}
+	for _, r := range region {
+		if r < 'a' || r > 'z' {
+			return "-"
+		}
+	}
+	return region
 }
 
 // pace records one side of a part. dur is the HTTP exchange. blocked and max_gap
 // are pauses between body reads. resp_wait is time until response headers for a
 // source, and time from the last body read until the response for a destination.
 // read_wait is time spent inside the body Read.
-func (t *transferLog) pace(part int, side string, status int, n int64, dur, blocked, maxGap, resp, readWait time.Duration) {
+func (t *transferLog) pace(part int, side string, status int, n int64, dur, blocked, maxGap, resp, readWait time.Duration, region string) {
 	rate := 0.0
 	if dur > 0 && n > 0 {
 		rate = float64(n) / dur.Seconds() / (1024 * 1024)
 	}
-	t.out("transfer pace workload=%s attempt=%s part=%d side=%s status=%d bytes=%d dur=%s rate_mib=%.2f blocked=%s max_gap=%s resp_wait=%s read_wait=%s active=%d",
+	t.out("transfer pace workload=%s attempt=%s part=%d side=%s status=%d bytes=%d dur=%s rate_mib=%.2f blocked=%s max_gap=%s resp_wait=%s read_wait=%s region=%s active=%d",
 		t.workload, t.attempt, part, side, status, n,
 		dur.Round(time.Millisecond), rate,
 		blocked.Round(time.Millisecond), maxGap.Round(time.Millisecond),
 		resp.Round(time.Millisecond), readWait.Round(time.Millisecond),
-		activeTransfers.Load())
+		regionLabel(region), activeTransfers.Load())
 }
 
 // pacePut is the destination line plus TCP acknowledgement evidence.
@@ -241,7 +255,7 @@ func (t *transferLog) pace(part int, side string, status int, n int64, dur, bloc
 // when the socket does not expose it. ackAge is how long that count has
 // been unchanged. upload is a short hash of the multipart upload id, and
 // partNo is the part number from the signed URL. The signed query is not logged.
-func (t *transferLog) pacePut(part int, status int, n int64, dur, blocked, maxGap, resp, readWait time.Duration, acked int64, known bool, ackAge time.Duration, upload, partNo string) {
+func (t *transferLog) pacePut(part int, status int, n int64, dur, blocked, maxGap, resp, readWait time.Duration, acked int64, known bool, ackAge time.Duration, upload, partNo, region string) {
 	if !known {
 		acked = -1
 		ackAge = 0
@@ -254,12 +268,12 @@ func (t *transferLog) pacePut(part int, status int, n int64, dur, blocked, maxGa
 	if known && dur > 0 && acked > 0 {
 		ackRate = float64(acked) / dur.Seconds() / (1024 * 1024)
 	}
-	t.out("transfer pace workload=%s attempt=%s part=%d side=%s status=%d bytes=%d dur=%s rate_mib=%.2f blocked=%s max_gap=%s resp_wait=%s read_wait=%s acked=%d ack_mib=%.2f ack_age=%s upload=%s part_no=%s active=%d",
+	t.out("transfer pace workload=%s attempt=%s part=%d side=%s status=%d bytes=%d dur=%s rate_mib=%.2f blocked=%s max_gap=%s resp_wait=%s read_wait=%s acked=%d ack_mib=%.2f ack_age=%s upload=%s part_no=%s region=%s active=%d",
 		t.workload, t.attempt, part, "destination", status, n,
 		dur.Round(time.Millisecond), rate,
 		blocked.Round(time.Millisecond), maxGap.Round(time.Millisecond),
 		resp.Round(time.Millisecond), readWait.Round(time.Millisecond),
-		acked, ackRate, ackAge.Round(time.Millisecond), upload, partNo,
+		acked, ackRate, ackAge.Round(time.Millisecond), upload, partNo, regionLabel(region),
 		activeTransfers.Load())
 }
 

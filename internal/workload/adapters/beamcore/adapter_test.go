@@ -37,6 +37,25 @@ func boxPartOffer() TaskOffer {
 	}
 }
 
+func TestToWorkloadKeepsStorageRegion(t *testing.T) {
+	enam, apac := "enam", "apac"
+	offer := singleDestinationOffer()
+	offer.Source.Region = &enam
+	offer.Destinations[0].Region = &apac
+	spec, err := ToWorkload(offer, time.Minute, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload contracts.MultipartTransfer
+	if err := json.Unmarshal(spec.Payload, &payload); err != nil {
+		t.Fatal(err)
+	}
+	part := payload.Parts[0]
+	if part.Source.Region != "enam" || part.Destination.Region != "apac" {
+		t.Fatalf("regions: source=%q destination=%q", part.Source.Region, part.Destination.Region)
+	}
+}
+
 func TestToWorkloadMapsAuthenticatedBoxPart(t *testing.T) {
 	now := time.Now()
 	spec, err := ToWorkload(boxPartOffer(), time.Minute, now)
