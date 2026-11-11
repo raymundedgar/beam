@@ -513,7 +513,8 @@ func (h *Handler) readSourceOnce(ctx context.Context, part contracts.TransferPar
 }
 
 func (h *Handler) readBody(parent, attempt context.Context, part contracts.TransferPart, counter *byteCounter, started time.Time, buf *followBuffer, stamp *sourceStamp) ([]byte, error) {
-	response, err := h.openSourceFrom(attempt, part, 0, "")
+	var peer atomic.Value
+	response, err := h.openSourceFrom(attempt, part, 0, "", &peer)
 	if err != nil {
 		traceFrom(parent).pace(part.Index, "source", 0, counter.n.Load(), time.Since(started), counter.blockedFor(), counter.longestGap(), 0, counter.waitedInRead(), part.Source.Region)
 		if reset := resetFromStatus(err); reset != nil {
@@ -548,6 +549,9 @@ func (h *Handler) readBody(parent, attempt context.Context, part contracts.Trans
 		body, readErr = readInto(counter, buf, part.Length, attempt)
 	}
 	traceFrom(parent).pace(part.Index, "source", response.StatusCode, int64(len(body)), time.Since(started), counter.blockedFor(), counter.longestGap(), respWait, counter.waitedInRead(), part.Source.Region)
+	if conn, _ := peer.Load().(net.Conn); conn != nil {
+		traceFrom(parent).readPeer(remoteIP(conn), ipFamilyOf(remoteIP(conn)), cfColo(response.Header), int64(len(body)), time.Since(started))
+	}
 	if int64(len(body)) == part.Length && part.Length > 0 {
 		elapsed := time.Since(started).Seconds()
 		if elapsed > 0 {
@@ -1099,16 +1103,25 @@ func (h *Handler) executePresignedPart(ctx context.Context, part contracts.Trans
 
 // openSource returns a successful source response; the caller closes its body.
 func (h *Handler) openSource(ctx context.Context, part contracts.TransferPart) (*http.Response, error) {
-	return h.openSourceFrom(ctx, part, 0, "")
+	return h.openSourceFrom(ctx, part, 0, "", nil)
 }
 
 // openSourceFrom reads part, or the unread tail when resume is past the start.
 // A strong etag sends If-Range so a changed object comes back as a full 200
 // instead of a 206 that would append bytes from a different version.
-func (h *Handler) openSourceFrom(ctx context.Context, part contracts.TransferPart, resume int64, etag string) (*http.Response, error) {
+func (h *Handler) openSourceFrom(ctx context.Context, part contracts.TransferPart, resume int64, etag string, peer *atomic.Value) (*http.Response, error) {
 	sourceRequest, err := http.NewRequestWithContext(ctx, http.MethodGet, part.Source.URL, nil)
 	if err != nil {
 		return nil, fmt.Errorf("create source request: %w", err)
+	}
+	if peer != nil {
+		sourceRequest = sourceRequest.WithContext(httptrace.WithClientTrace(sourceRequest.Context(), &httptrace.ClientTrace{
+			GotConn: func(info httptrace.GotConnInfo) {
+				if info.Conn != nil {
+					peer.Store(info.Conn)
+				}
+			},
+		}))
 	}
 	copyHeaders(sourceRequest.Header, part.Source.Headers)
 	if spec, ok := sourceRangeHeader(part, resume); ok {

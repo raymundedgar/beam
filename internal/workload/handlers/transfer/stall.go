@@ -324,6 +324,18 @@ func (t *transferLog) etagMismatch(upload, part, etag, md5sum string) {
 		t.workload, t.attempt, upload, part, etag, md5sum)
 }
 
+func (t *transferLog) readPeer(remote, family, colo string, n int64, dur time.Duration) {
+	if t == nil {
+		return
+	}
+	rate := 0.0
+	if dur > 0 {
+		rate = float64(n) / dur.Seconds() / (1024 * 1024)
+	}
+	t.out("transfer read_peer workload=%s attempt=%s remote=%s family=%s colo=%s bytes=%d dur=%s rate_mib=%.2f",
+		t.workload, t.attempt, remote, family, colo, n, dur.Round(time.Millisecond), rate)
+}
+
 func (t *transferLog) readSkip(n int64) {
 	if t == nil || n <= 0 {
 		return

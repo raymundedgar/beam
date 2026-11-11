@@ -290,6 +290,17 @@ func discardUploadSocket(conn net.Conn) {
 	_ = conn.Close()
 }
 
+func ipFamilyOf(host string) string {
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return "-"
+	}
+	if ip.To4() != nil {
+		return "v4"
+	}
+	return "v6"
+}
+
 func remoteIP(conn net.Conn) string {
 	if conn == nil || conn.RemoteAddr() == nil {
 		return "-"

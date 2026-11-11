@@ -11,6 +11,18 @@ import (
 	"time"
 )
 
+func TestIPFamily(t *testing.T) {
+	if ipFamilyOf("172.64.66.1") != "v4" {
+		t.Fatal("v4")
+	}
+	if ipFamilyOf("2606:4700:113::1") != "v6" {
+		t.Fatal("v6")
+	}
+	if ipFamilyOf("") != "-" {
+		t.Fatal("empty")
+	}
+}
+
 func TestTwoSlowSecondsDiscardAndOneFastSecondDoesNot(t *testing.T) {
 	var windows ackWindows
 	start := time.Now()
