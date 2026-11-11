@@ -39,7 +39,8 @@ func readTCP(conn net.Conn) tcpSnap {
 			acked: int64(info.Bytes_acked), rttUs: info.Rtt, cwnd: info.Snd_cwnd,
 			retrans: info.Total_retrans, deliveryRate: info.Delivery_rate,
 			rwndLimited: info.Rwnd_limited, sndbufLimited: info.Sndbuf_limited,
-			sndbuf: buf, ok: true,
+			sndbuf: buf, sndWnd: info.Snd_wnd, sndMss: info.Snd_mss,
+			rtoUs: info.Rto, backoff: info.Backoff, unacked: info.Unacked, ok: true,
 		}
 	})
 	if err != nil {

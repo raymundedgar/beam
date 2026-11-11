@@ -24,6 +24,11 @@ type tcpSnap struct {
 	rwndLimited   uint64
 	sndbufLimited uint64
 	sndbuf        int
+	sndWnd        uint32
+	sndMss        uint32
+	rtoUs         uint32
+	backoff       uint8
+	unacked       uint32
 	ok            bool
 }
 
@@ -107,6 +112,36 @@ func putSlowStreak(progress, total int64) int {
 	return 2
 }
 
+// putInTail is the last part of an upload. A zero-ack stall there waits 8s,
+// because the 08:09 task had already acknowledged 40 MiB of 43 and the next
+// sockets were slower.
+func putInTail(progress, total int64) bool {
+	if total <= 0 || progress <= 0 {
+		return false
+	}
+	if progress*100 >= total*85 {
+		return true
+	}
+	return total > 4<<20 && total-progress < 4<<20
+}
+
+const putTailZero = 8
+
+// tinyPeerWindow is an advertised window that cannot accept a useful burst.
+// A zero window and a window under 16 KiB are the peer's receive buffer, so
+// a new socket does not move the bytes. putHoldCap is how long that hold
+// lasts before the socket is discarded anyway.
+const tinyPeerWindow = 16 << 10
+
+const putHoldCap = 25 * time.Second
+
+func peerWindowBlocked(s tcpSnap) bool {
+	if !s.ok {
+		return false
+	}
+	return s.sndWnd < tinyPeerWindow
+}
+
 func (w *ackWindows) reset(now time.Time, acked int64) {
 	w.mu.Lock()
 	w.at, w.base, w.have, w.lows = now, acked, true, 0
@@ -117,7 +152,7 @@ func (w *ackWindows) reset(now time.Time, acked int64) {
 // A socket that has already moved 16 MiB needs four slow seconds. Two slow
 // seconds discard a socket that has not. A replacement that is not faster than
 // the socket it replaced is kept.
-func watchPutRecent(ctx context.Context, cancel context.CancelCauseFunc, total int64, window time.Duration, minRate int64, acked func() (int64, bool), paused func() bool, pace *putPace, onSample func(rate float64, acked int64), onStall func(rate float64, acked int64)) {
+func watchPutRecent(ctx context.Context, cancel context.CancelCauseFunc, total int64, window time.Duration, minRate int64, acked func() (int64, bool), snapFn func() tcpSnap, paused func() bool, pace *putPace, onSample func(rate float64, acked int64), onStall func(rate float64, acked int64, snap tcpSnap, decision string), onLate func()) {
 	if window <= 0 || acked == nil {
 		return
 	}
@@ -132,6 +167,9 @@ func watchPutRecent(ctx context.Context, cancel context.CancelCauseFunc, total i
 	defer ticker.Stop()
 	var windows ackWindows
 	attemptAcked := int64(-1)
+	var zeros int
+	lateSent := false
+	var holdSince time.Time
 	for {
 		select {
 		case <-ctx.Done():
@@ -156,15 +194,57 @@ func watchPutRecent(ctx context.Context, cancel context.CancelCauseFunc, total i
 			if onSample != nil {
 				onSample(rate, n)
 			}
-			if lows < putSlowStreak(progress, total) || cancel == nil {
+			if rate == 0 {
+				zeros++
+			} else {
+				zeros = 0
+			}
+			if onLate != nil && !lateSent && zeros >= 2 {
+				lateSent = true
+				onLate()
+			}
+			stall := lows >= putSlowStreak(progress, total)
+			if rate == 0 && putInTail(progress, total) {
+				stall = zeros >= putTailZero
+			}
+			// A late probe keeps this socket up through a 2s silence. A zero
+			// window still discards after the 8s tail wait.
+			if onLate != nil && rate == 0 && zeros < putTailZero {
+				stall = false
+			}
+			if !stall || cancel == nil {
 				continue
+			}
+			var snap tcpSnap
+			if snapFn != nil {
+				snap = snapFn()
+			}
+			if peerWindowBlocked(snap) {
+				if holdSince.IsZero() {
+					holdSince = now
+				}
+				if now.Sub(holdSince) < putHoldCap {
+					if onStall != nil {
+						onStall(rate, n, snap, "hold_rwnd")
+					}
+					continue
+				}
+				if onLate != nil && !lateSent {
+					lateSent = true
+					onLate()
+				}
+				if onStall != nil {
+					onStall(rate, n, snap, "hold_expired")
+				}
+			} else {
+				holdSince = time.Time{}
 			}
 			if pace.notFaster(int64(rate)) {
 				continue
 			}
 			pace.discarded(int64(rate))
-			if onStall != nil {
-				onStall(rate, n)
+			if onStall != nil && !peerWindowBlocked(snap) {
+				onStall(rate, n, snap, "discard")
 			}
 			cancel(errReplaced)
 			return
@@ -251,7 +331,7 @@ func (h *Handler) putParallel(ctx context.Context, part contracts.TransferPart, 
 	var progA atomic.Int64
 	chA := make(chan outcome, 1)
 	go func() {
-		res, err := h.putPresignedOnce(ctxA, part, open, size, digest, false, &progA, nil)
+		res, err := h.putPresignedOnce(ctxA, part, open, size, digest, false, &progA, nil, nil)
 		chA <- outcome{res, err}
 	}()
 	wait := time.NewTimer(putWindow)
@@ -276,10 +356,83 @@ func (h *Handler) putParallel(ctx context.Context, part contracts.TransferPart, 
 	var progB atomic.Int64
 	chB := make(chan outcome, 1)
 	go func() {
-		res, err := h.putPresignedOnce(ctxB, part, open, size, digest, false, &progB, nil)
+		res, err := h.putPresignedOnce(ctxB, part, open, size, digest, false, &progB, nil, nil)
 		chB <- outcome{res, err}
 	}()
 	wait.Reset(putWindow)
+	select {
+	case <-ctx.Done():
+		cancelA(context.Canceled)
+		cancelB(context.Canceled)
+		<-chA
+		<-chB
+		return partResult{bytes: size}, ctx.Err()
+	case out := <-chA:
+		cancelB(errReplaced)
+		traceFrom(ctx).putProbe(0, progA.Load()-baseA, progB.Load())
+		return out.result, out.err
+	case out := <-chB:
+		cancelA(errReplaced)
+		traceFrom(ctx).putProbe(1, progA.Load()-baseA, progB.Load())
+		return out.result, out.err
+	case <-wait.C:
+	}
+	deltaA := progA.Load() - baseA
+	deltaB := progB.Load()
+	if deltaB > deltaA {
+		traceFrom(ctx).putProbe(1, deltaA, deltaB)
+		cancelA(errReplaced)
+		out := <-chB
+		return out.result, out.err
+	}
+	traceFrom(ctx).putProbe(0, deltaA, deltaB)
+	cancelB(errReplaced)
+	out := <-chA
+	return out.result, out.err
+}
+
+// putLate leaves the current upload up and, after two seconds with no
+// acknowledgements, starts a second one on the same bytes. The faster socket
+// is kept. Off unless BEAM_WORKER_PUT_LATE_PROBE=1.
+func (h *Handler) putLate(ctx context.Context, part contracts.TransferPart, open bodyOpen, size int64, digest string) (partResult, error) {
+	type outcome struct {
+		result partResult
+		err    error
+	}
+	ctxA, cancelA := context.WithCancelCause(ctx)
+	defer cancelA(context.Canceled)
+	var progA atomic.Int64
+	chA := make(chan outcome, 1)
+	probe := make(chan struct{}, 1)
+	go func() {
+		res, err := h.putPresignedOnce(ctxA, part, open, size, digest, true, &progA, nil, func() {
+			select {
+			case probe <- struct{}{}:
+			default:
+			}
+		})
+		chA <- outcome{res, err}
+	}()
+	select {
+	case <-ctx.Done():
+		cancelA(context.Canceled)
+		<-chA
+		return partResult{bytes: size}, ctx.Err()
+	case out := <-chA:
+		return out.result, out.err
+	case <-probe:
+	}
+	baseA := progA.Load()
+	ctxB, cancelB := context.WithCancelCause(ctx)
+	defer cancelB(context.Canceled)
+	var progB atomic.Int64
+	chB := make(chan outcome, 1)
+	go func() {
+		res, err := h.putPresignedOnce(ctxB, part, open, size, digest, false, &progB, nil, nil)
+		chB <- outcome{res, err}
+	}()
+	wait := time.NewTimer(putWindow)
+	defer wait.Stop()
 	select {
 	case <-ctx.Done():
 		cancelA(context.Canceled)

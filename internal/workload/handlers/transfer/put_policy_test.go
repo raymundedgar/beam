@@ -34,6 +34,59 @@ func TestTwoSlowSecondsDiscardAndOneFastSecondDoesNot(t *testing.T) {
 	}
 }
 
+func TestTailZeroWaitsAndTinyWindowHolds(t *testing.T) {
+	if putInTail(40<<20, 43<<20) != true {
+		t.Fatal("40 MiB of 43 was not treated as the tail")
+	}
+	if putInTail(1<<20, 50<<20) {
+		t.Fatal("the first megabyte was treated as the tail")
+	}
+	if putInTail(0, 50<<20) {
+		t.Fatal("a socket with no acknowledgements was treated as the tail")
+	}
+	if !peerWindowBlocked(tcpSnap{ok: true, sndWnd: 0, sndMss: 1460}) {
+		t.Fatal("a zero peer window was discarded")
+	}
+	if !peerWindowBlocked(tcpSnap{ok: true, sndWnd: 1460, sndMss: 1460}) {
+		t.Fatal("a one-segment window was discarded")
+	}
+	if peerWindowBlocked(tcpSnap{ok: true, sndWnd: 64 << 10, sndMss: 1460}) {
+		t.Fatal("an open peer window was held")
+	}
+	if peerWindowBlocked(tcpSnap{}) {
+		t.Fatal("a socket with no TCP info was held")
+	}
+}
+
+func TestFullRereadKeepsANearlyFinishedSlowRead(t *testing.T) {
+	const mib = 1 << 20
+	size := int64(43 * mib)
+	median := 12.6 * mib
+	current := 3.9 * mib
+	if readRestartWorth(size*95/100, size, current, median) {
+		t.Fatal("a 3.9 MiB/s read at 95% was restarted")
+	}
+	if !readRestartWorth(size*10/100, size, current, median) {
+		t.Fatal("a 3.9 MiB/s read at 10% was kept")
+	}
+	if readRestartWorth(size*10/100, size, current, 0) {
+		t.Fatal("an empty median restarted a read")
+	}
+}
+
+func TestTwoDisappointingRestartsStop(t *testing.T) {
+	var pace readPace
+	if pace.block(1 << 20) {
+		t.Fatal("the first slow socket was not allowed to restart")
+	}
+	if pace.block(1 << 20) {
+		t.Fatal("the first replacement that tied the previous rate stopped immediately")
+	}
+	if !pace.block(512 << 10) {
+		t.Fatal("a second slower replacement was restarted again")
+	}
+}
+
 func TestProvenUploadNeedsFourSlowSeconds(t *testing.T) {
 	if putSlowStreak(1<<20, 50<<20) != 2 {
 		t.Fatal("a fresh upload discarded on one slow second")

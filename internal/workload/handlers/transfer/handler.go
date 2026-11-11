@@ -79,6 +79,7 @@ func NewHandler(client *http.Client) *Handler {
 	if client == nil {
 		client = storagehttp.NewClient(30 * time.Minute)
 	}
+	logPolicy()
 	return &Handler{client: client, wait: sleepContext, logf: log.Printf, slots: transferSlots(), uploads: uploadSlots()}
 }
 
@@ -372,33 +373,35 @@ func (h *Handler) readSourcePublish(ctx context.Context, part contracts.Transfer
 	var lastErr error
 	httpAttempts := 0
 	replacements := 0
+	var pace readPace
+	var buf *followBuffer
+	if publish != nil {
+		buf = newFollowBuffer(part.Length)
+		publish(buf)
+	}
 	for {
 		if err := ctx.Err(); err != nil {
+			if buf != nil {
+				buf.fail(err)
+			}
 			return nil, err
 		}
 		// Restart from the signed request. Adding Range or If-Range changes a
 		// presigned URL and R2 answers 403 SignatureDoesNotMatch, which the
 		// worker would report as its own failure.
-		// A slow connection is closed and the signed GET is repeated. Keeping
-		// the slow one, and only one extra, left both near 1 MiB/s until Beam
-		// cancelled the offer.
-		var buf *followBuffer
-		if publish != nil {
-			buf = newFollowBuffer(part.Length)
-			publish(buf)
-		}
-		body, err := h.readSourceOnce(ctx, part, replacements < maxSourceReplacements, buf)
-		if buf != nil {
-			if err != nil {
-				buf.fail(err)
-			} else {
+		// A slow connection is closed and the signed GET is repeated. Bytes
+		// already buffered stay, and the upload keeps reading them.
+		body, err := h.readSourceOnce(ctx, part, replacements < maxSourceReplacements, replacements < readRestartCap && !pace.done(), buf, &pace)
+		if err == nil {
+			if buf != nil {
 				buf.finish()
 			}
-		}
-		if err == nil {
 			return body, nil
 		}
 		if ctx.Err() != nil {
+			if buf != nil {
+				buf.fail(ctx.Err())
+			}
 			return nil, ctx.Err()
 		}
 		lastErr = err
@@ -409,13 +412,23 @@ func (h *Handler) readSourcePublish(ctx context.Context, part contracts.Transfer
 		if errors.Is(err, errStalled) {
 			if waitErr := h.backoff(ctx, 1); waitErr != nil {
 				<-ctx.Done()
+				if buf != nil {
+					buf.fail(ctx.Err())
+				}
 				return nil, ctx.Err()
 			}
 			continue
 		}
 		httpAttempts++
 		if !transientTransferError(err) || httpAttempts >= presignedAttempts {
+			if buf != nil {
+				buf.fail(err)
+			}
 			return nil, err
+		}
+		// A failed attempt is not a prefix worth keeping. A rate restart is.
+		if buf != nil {
+			buf.reset()
 		}
 		if waitErr := h.backoff(ctx, httpAttempts); waitErr != nil {
 			if ctx.Err() != nil {
@@ -426,7 +439,7 @@ func (h *Handler) readSourcePublish(ctx context.Context, part contracts.Transfer
 	}
 }
 
-func (h *Handler) readSourceOnce(ctx context.Context, part contracts.TransferPart, allowReplace bool, buf *followBuffer) ([]byte, error) {
+func (h *Handler) readSourceOnce(ctx context.Context, part contracts.TransferPart, allowReplace, allowMedian bool, buf *followBuffer, pace *readPace) ([]byte, error) {
 	started := time.Now()
 	counter := &byteCounter{onFirst: func() { traceFrom(ctx).moved(part.Index, "source") }}
 	var expected atomic.Int64
@@ -439,6 +452,15 @@ func (h *Handler) readSourceOnce(ctx context.Context, part contracts.TransferPar
 		// Copied before the goroutine so tests can change the package values.
 		probe, budget, minBytes := hedgeAfter, sourceBudget, hedgeMinBytes
 		go watchSourceRate(attemptCtx, cancel, &counter.n, part.Length, probe, budget, minBytes)
+	}
+	if allowMedian && readMedian && part.Length >= hedgeMinBytes {
+		have := func() int64 {
+			if buf != nil {
+				return buf.Len()
+			}
+			return counter.n.Load()
+		}
+		go watchReadMedian(attemptCtx, cancel, &counter.n, have, part.Length, hostOf(part.Source.URL), pace)
 	}
 	body, err := h.readBody(ctx, stallCtx, part, counter, started, buf)
 	if ctx.Err() != nil {
@@ -474,9 +496,18 @@ func (h *Handler) readBody(parent, attempt context.Context, part contracts.Trans
 		n, readErr = io.ReadFull(counter, chunk)
 		body = chunk[:n]
 	} else {
+		if buf.Len() > 0 {
+			traceFrom(parent).readSkip(buf.Len())
+		}
 		body, readErr = readInto(counter, buf, part.Length, attempt)
 	}
 	traceFrom(parent).pace(part.Index, "source", response.StatusCode, int64(len(body)), time.Since(started), counter.blockedFor(), counter.longestGap(), respWait, counter.waitedInRead(), part.Source.Region)
+	if int64(len(body)) == part.Length && part.Length > 0 {
+		elapsed := time.Since(started).Seconds()
+		if elapsed > 0 {
+			readHosts.observe(hostOf(part.Source.URL), float64(len(body))/elapsed)
+		}
+	}
 	if int64(len(body)) == part.Length {
 		return body, nil
 	}
@@ -542,6 +573,20 @@ func (h *Handler) putStream(ctx context.Context, part contracts.TransferPart, op
 	if putParallelProbe && size >= hedgeMinBytes {
 		return h.putParallel(ctx, part, open, size, digest)
 	}
+	if putLateProbe && size >= hedgeMinBytes {
+		replaced := 0
+		pace := &putPace{}
+		return h.retryPresigned(ctx, func() (partResult, error) {
+			if pace.stopped() || !replaceSlowUpload(ctx, replaced) {
+				return h.putPresignedOnce(ctx, part, open, size, digest, false, nil, pace, nil)
+			}
+			result, err := h.putLate(ctx, part, open, size, digest)
+			if errors.Is(err, errReplaced) {
+				replaced++
+			}
+			return result, err
+		})
+	}
 	replaced := 0
 	pace := &putPace{}
 	return h.retryPresigned(ctx, func() (partResult, error) {
@@ -555,7 +600,7 @@ func (h *Handler) putStream(ctx context.Context, part contracts.TransferPart, op
 			replaced += used
 			return result, err
 		}
-		result, err := h.putPresignedOnce(ctx, part, open, size, digest, allow, nil, pace)
+		result, err := h.putPresignedOnce(ctx, part, open, size, digest, allow, nil, pace, nil)
 		if errors.Is(err, errReplaced) {
 			replaced++
 		}
@@ -577,7 +622,7 @@ func (h *Handler) putPresignedHedged(ctx context.Context, part contracts.Transfe
 	ch := make(chan outcome, 2)
 	var progress atomic.Int64
 	go func() {
-		result, err := h.putPresignedOnce(attemptCtx, part, open, size, digest, true, &progress, nil)
+		result, err := h.putPresignedOnce(attemptCtx, part, open, size, digest, true, &progress, nil, nil)
 		ch <- outcome{result, err}
 	}()
 	hedgeAt := putAckQuiet / 2
@@ -607,7 +652,7 @@ func (h *Handler) putPresignedHedged(ctx context.Context, part contracts.Transfe
 			}
 			pending++
 			go func() {
-				result, err := h.putPresignedOnce(attemptCtx, part, open, size, digest, true, nil, nil)
+				result, err := h.putPresignedOnce(attemptCtx, part, open, size, digest, true, nil, nil, nil)
 				ch <- outcome{result, err}
 			}()
 		case o := <-ch:
@@ -667,7 +712,7 @@ func (h *Handler) retryPresigned(ctx context.Context, attemptFn func() (partResu
 	}
 }
 
-func (h *Handler) putPresignedOnce(ctx context.Context, part contracts.TransferPart, open bodyOpen, size int64, digest string, allowReplace bool, progress *atomic.Int64, pace *putPace) (partResult, error) {
+func (h *Handler) putPresignedOnce(ctx context.Context, part contracts.TransferPart, open bodyOpen, size int64, digest string, allowReplace bool, progress *atomic.Int64, pace *putPace, onLate func()) (partResult, error) {
 	destinationMethod := strings.ToUpper(strings.TrimSpace(part.Destination.Method))
 	if destinationMethod == "" {
 		destinationMethod = http.MethodPut
@@ -716,15 +761,23 @@ func (h *Handler) putPresignedOnce(ctx context.Context, part contracts.TransferP
 			}
 			return n, true
 		}
+		snapNow := func() tcpSnap {
+			conn, _ := held.Load().(net.Conn)
+			return readTCP(conn)
+		}
 		if putPolicy {
-			go watchPutRecent(attemptCtx, stallCancel, total, putWindow, minRate, sampleAck, paused, pace,
+			go watchPutRecent(attemptCtx, stallCancel, total, putWindow, minRate, sampleAck, snapNow, paused, pace,
 				func(rate float64, n int64) {
 					traceFrom(ctx).putSample(uploadID, partNo, rate, n)
 				},
-				func(rate float64, n int64) {
+				func(rate float64, n int64, snap tcpSnap, decision string) {
+					traceFrom(ctx).putWindow(uploadID, partNo, snap, rate, decision)
+					if decision == "hold_rwnd" {
+						return
+					}
 					traceFrom(ctx).replaced(part.Index, "destination", "ack_stall", counter.n.Load(), int64(rate))
-					traceFrom(ctx).putDiscard(uploadID, partNo, "slow_1s", rate, n)
-				})
+					traceFrom(ctx).putDiscard(uploadID, partNo, decision, rate, n, snap)
+				}, onLate)
 		} else {
 			go watchPutAck(attemptCtx, stallCancel, &counter.n, total, quiet, minRate, sampleAck, func(written, acked int64) {
 				traceFrom(ctx).replaced(part.Index, "destination", "ack_stall", written, acked)

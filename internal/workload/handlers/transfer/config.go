@@ -34,6 +34,15 @@ var (
 	// slow, and only when BEAM_WORKER_PUT_PARALLEL_PROBE=1. It stays off until
 	// a same-part concurrent PUT is confirmed on R2.
 	putParallelProbe = false
+	// putLateProbe starts a second upload when acknowledgements stop for 2s and
+	// leaves the first socket up. Off unless BEAM_WORKER_PUT_LATE_PROBE=1.
+	putLateProbe = false
+	// readMedian restarts a download when the last second would take more than
+	// readMedianFactor times as long as the recent per-host rate. The read cap
+	// is higher than the fixed 8s budget's cap.
+	readMedian       = true
+	readRestartCap   = 10
+	readMedianFactor = 1.5
 )
 
 func init() {
@@ -42,6 +51,13 @@ func init() {
 	putPolicy = envBool("BEAM_WORKER_PUT_POLICY", true)
 	putLinger = envBool("BEAM_WORKER_PUT_LINGER", true)
 	putParallelProbe = envBool("BEAM_WORKER_PUT_PARALLEL_PROBE", false)
+	putLateProbe = envBool("BEAM_WORKER_PUT_LATE_PROBE", false)
+	readMedian = envBool("BEAM_WORKER_READ_MEDIAN", true)
+	if raw := os.Getenv("BEAM_WORKER_READ_RESTARTS"); raw != "" {
+		if parsed, err := strconv.Atoi(raw); err == nil && parsed >= 0 {
+			readRestartCap = parsed
+		}
+	}
 	if raw := os.Getenv("BEAM_WORKER_PUT_MAX_DISCARDS"); raw != "" {
 		if parsed, err := strconv.Atoi(raw); err == nil && parsed >= 0 {
 			putMaxDiscards = parsed

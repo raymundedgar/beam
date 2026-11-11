@@ -230,12 +230,51 @@ func (t *transferLog) putSample(upload, part string, bytesPerSec float64, acked 
 		t.workload, t.attempt, upload, part, acked, bytesPerSec/(1024*1024))
 }
 
-func (t *transferLog) putDiscard(upload, part, reason string, bytesPerSec float64, acked int64) {
+func (t *transferLog) putDiscard(upload, part, reason string, bytesPerSec float64, acked int64, snap tcpSnap) {
 	if t == nil {
 		return
 	}
-	t.out("transfer put_discard workload=%s attempt=%s upload=%s part_no=%s reason=%s acked=%d rate_1s=%.2f",
-		t.workload, t.attempt, upload, part, reason, acked, bytesPerSec/(1024*1024))
+	t.out("transfer put_discard workload=%s attempt=%s upload=%s part_no=%s reason=%s acked=%d rate_1s=%.2f snd_wnd=%d rto_us=%d backoff=%d unacked=%d",
+		t.workload, t.attempt, upload, part, reason, acked, bytesPerSec/(1024*1024), snap.sndWnd, snap.rtoUs, snap.backoff, snap.unacked)
+}
+
+func (t *transferLog) putWindow(upload, part string, snap tcpSnap, bytesPerSec float64, decision string) {
+	if t == nil {
+		return
+	}
+	t.out("transfer put_window workload=%s attempt=%s upload=%s part_no=%s snd_wnd=%d rto_us=%d backoff=%d unacked=%d rate_1s=%.2f decision=%s build=%s",
+		t.workload, t.attempt, upload, part, snap.sndWnd, snap.rtoUs, snap.backoff, snap.unacked, bytesPerSec/(1024*1024), decision, buildID)
+}
+
+func (t *transferLog) readRestart(host string, have int64, bytesPerSec, median float64) {
+	if t == nil {
+		return
+	}
+	t.out("transfer read_restart workload=%s attempt=%s host=%s have=%d rate_1s=%.2f median=%.2f build=%s",
+		t.workload, t.attempt, host, have, bytesPerSec/(1024*1024), median/(1024*1024), buildID)
+}
+
+func (t *transferLog) readKeep(host, reason string, have int64, bytesPerSec, median float64) {
+	if t == nil {
+		return
+	}
+	t.out("transfer read_keep workload=%s attempt=%s host=%s reason=%s have=%d rate_1s=%.2f median=%.2f build=%s",
+		t.workload, t.attempt, host, reason, have, bytesPerSec/(1024*1024), median/(1024*1024), buildID)
+}
+
+func (t *transferLog) readMedianEmpty(host string) {
+	if t == nil {
+		return
+	}
+	t.out("transfer read_median workload=%s attempt=%s host=%s samples=0 build=%s",
+		t.workload, t.attempt, host, buildID)
+}
+
+func (t *transferLog) readSkip(n int64) {
+	if t == nil || n <= 0 {
+		return
+	}
+	t.out("transfer read_skip workload=%s attempt=%s bytes=%d build=%s", t.workload, t.attempt, n, buildID)
 }
 
 func (t *transferLog) putAttempt(remote, colo, bucket, upload, part, reason string, snap tcpSnap, acked int64) {
@@ -274,9 +313,9 @@ func (t *transferLog) reported(batch string, leader, cut bool) {
 	if batch == "" {
 		batch = "-"
 	}
-	t.out("transfer report workload=%s attempt=%s batch=%s first_deliverer=%t ttfb=%s put_start=%s result=%s cut=%t",
+	t.out("transfer report workload=%s attempt=%s batch=%s first_deliverer=%t ttfb=%s put_start=%s result=%s cut=%t %s",
 		t.workload, t.attempt, batch, leader,
-		reportDur(ttfb), reportDur(putStart), time.Since(t.started).Round(time.Millisecond), cut)
+		reportDur(ttfb), reportDur(putStart), time.Since(t.started).Round(time.Millisecond), cut, policyStamp())
 }
 
 func reportDur(d time.Duration) string {

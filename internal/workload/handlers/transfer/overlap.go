@@ -15,6 +15,13 @@ import (
 
 func readInto(r io.Reader, buf *followBuffer, total int64, ctx context.Context) ([]byte, error) {
 	tmp := make([]byte, 256<<10)
+	// A restarted GET repeats the signed request from byte 0. Bytes already
+	// in the buffer are skipped so the upload reader is not reset.
+	have := int64(0)
+	if buf != nil {
+		have = buf.Len()
+	}
+	var skipped int64
 	var got int64
 	for got < total {
 		if err := ctx.Err(); err != nil {
@@ -22,8 +29,21 @@ func readInto(r io.Reader, buf *followBuffer, total int64, ctx context.Context) 
 		}
 		n, err := r.Read(tmp)
 		if n > 0 {
-			if _, werr := buf.Write(tmp[:n]); werr != nil {
-				return buf.bytes(), werr
+			chunk := tmp[:n]
+			if skipped < have {
+				need := have - skipped
+				if int64(len(chunk)) <= need {
+					skipped += int64(len(chunk))
+					chunk = nil
+				} else {
+					chunk = chunk[need:]
+					skipped = have
+				}
+			}
+			if len(chunk) > 0 {
+				if _, werr := buf.Write(chunk); werr != nil {
+					return buf.bytes(), werr
+				}
 			}
 			got += int64(n)
 		}
@@ -78,6 +98,15 @@ func (b *followBuffer) finish() {
 	if b.err == nil {
 		b.done = true
 	}
+	b.cond.Broadcast()
+	b.mu.Unlock()
+}
+
+func (b *followBuffer) reset() {
+	b.mu.Lock()
+	b.buf = b.buf[:0]
+	b.done = false
+	b.err = nil
 	b.cond.Broadcast()
 	b.mu.Unlock()
 }

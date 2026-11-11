@@ -1,0 +1,193 @@
+package transfer
+
+import (
+	"context"
+	"net"
+	"net/url"
+	"sort"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+// hostRates keeps the last few completed download rates for each source host.
+type hostRates struct {
+	mu sync.Mutex
+	m  map[string][]float64
+}
+
+const hostRateKeep = 8
+
+func (h *hostRates) observe(host string, bytesPerSec float64) {
+	if host == "" || host == "-" || bytesPerSec <= 0 || loopback(host) {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.m == nil {
+		h.m = make(map[string][]float64)
+	}
+	rates := append(h.m[host], bytesPerSec)
+	if len(rates) > hostRateKeep {
+		rates = rates[len(rates)-hostRateKeep:]
+	}
+	h.m[host] = rates
+}
+
+func (h *hostRates) median(host string) float64 {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	rates := h.m[host]
+	if len(rates) == 0 {
+		return 0
+	}
+	cp := append([]float64(nil), rates...)
+	sort.Float64s(cp)
+	mid := len(cp) / 2
+	if len(cp)%2 == 1 {
+		return cp[mid]
+	}
+	return (cp[mid-1] + cp[mid]) / 2
+}
+
+var readHosts hostRates
+
+func loopback(host string) bool {
+	name, _, err := net.SplitHostPort(host)
+	if err != nil {
+		name = host
+	}
+	return name == "localhost" || name == "127.0.0.1" || name == "::1"
+}
+
+func hostOf(raw string) string {
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Host == "" {
+		return "-"
+	}
+	return parsed.Host
+}
+
+// readRestartOverhead is the handshake added to a full re-read. The signed
+// GET cannot resume, so a restart pays for the whole object again.
+const readRestartOverhead = 200 * time.Millisecond
+
+// readPace counts replacement sockets that were not faster than the one they
+// replaced. Two in a row stops further median restarts.
+type readPace struct {
+	mu      sync.Mutex
+	prev    float64
+	misses  int
+	stopped bool
+}
+
+func (p *readPace) done() bool {
+	if p == nil {
+		return false
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.stopped
+}
+
+func (p *readPace) block(rate float64) bool {
+	if p == nil {
+		return false
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.stopped {
+		return true
+	}
+	if p.prev > 0 && rate <= p.prev {
+		p.misses++
+		if p.misses >= 2 {
+			p.stopped = true
+			return true
+		}
+	} else {
+		p.misses = 0
+	}
+	p.prev = rate
+	return false
+}
+
+// readRestartWorth is true when finishing the remainder at the current wire
+// rate costs more than 1.5 times a full re-read at the host median. A socket
+// that is 95% done stays, because the re-read starts at byte 0.
+func readRestartWorth(have, total int64, current, median float64) bool {
+	if median <= 0 || current <= 0 || total <= 0 || have >= total || have < 0 {
+		return false
+	}
+	remain := float64(total - have)
+	finish := remain / current
+	again := float64(total)/median + readRestartOverhead.Seconds()
+	return finish > readMedianFactor*again
+}
+
+func restartFitsLease(ctx context.Context, total int64, median float64) bool {
+	deadline, ok := ctx.Deadline()
+	if !ok || median <= 0 || total <= 0 {
+		return ok || median > 0
+	}
+	need := time.Duration(float64(total)/median*float64(time.Second)) + readRestartOverhead
+	return time.Until(deadline) > need
+}
+
+// watchReadMedian cancels a download when a full re-read at the host median
+// would finish the part sooner than the current socket. The fixed 8s budget
+// still applies separately and stops at 80%. This check does not.
+func watchReadMedian(ctx context.Context, cancel context.CancelCauseFunc, moved *atomic.Int64, have func() int64, total int64, host string, pace *readPace) {
+	if cancel == nil || !readMedian || host == "" || host == "-" || have == nil {
+		return
+	}
+	ticker := time.NewTicker(time.Second)
+	defer ticker.Stop()
+	var prev int64
+	var saw bool
+	var notedEmpty bool
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		n := moved.Load()
+		if !saw {
+			prev, saw = n, true
+			continue
+		}
+		delta := n - prev
+		prev = n
+		if delta < 0 {
+			delta = 0
+		}
+		got := have()
+		if got >= total || got < hedgeMinBytes {
+			continue
+		}
+		med := readHosts.median(host)
+		if med <= 0 {
+			if !notedEmpty {
+				notedEmpty = true
+				traceFrom(ctx).readMedianEmpty(host)
+			}
+			continue
+		}
+		rate := float64(delta)
+		if !readRestartWorth(got, total, rate, med) {
+			continue
+		}
+		if !restartFitsLease(ctx, total, med) {
+			traceFrom(ctx).readKeep(host, "lease", got, rate, med)
+			continue
+		}
+		if pace != nil && pace.block(rate) {
+			traceFrom(ctx).readKeep(host, "thrash", got, rate, med)
+			continue
+		}
+		traceFrom(ctx).readRestart(host, got, rate, med)
+		cancel(errReplaced)
+		return
+	}
+}
