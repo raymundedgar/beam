@@ -4,24 +4,27 @@
 #   ./throughput.sh          last wave
 #   ./throughput.sh watch    refresh every 2s; stake is read at most every 5 minutes
 #   ./throughput.sh all      every local task
+#   ./throughput.sh 4:40PM   every task from 4:40 PM local time onward
 set -euo pipefail
 cd "$(dirname "$0")"
 
 MODE="${1:-snapshot}"
+SINCE=""
 case "$MODE" in
   snapshot|watch|all) ;;
-  *) echo "usage: $0 [snapshot|watch|all]" >&2; exit 2 ;;
+  *) SINCE="$MODE"; MODE="since" ;;
 esac
 
 TOKEN=$(cat data/orchestrator/control-token)
 mkdir -p data/analytics
 
-python3 - "$MODE" "$TOKEN" <<'PY'
+python3 - "$MODE" "$TOKEN" "$SINCE" <<'PY'
 import hashlib, ipaddress, json, os, re, subprocess, sys, time, urllib.error, urllib.parse, urllib.request
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 
 MODE, TOKEN = sys.argv[1], sys.argv[2]
+SINCE_TEXT = sys.argv[3] if len(sys.argv) > 3 else ""
 TZ = timezone(timedelta(hours=8))
 MIB = 1024 * 1024
 EMISSION_EVERY = 5 * 60
@@ -318,11 +321,34 @@ def workload_ids(task):
         found.append(wid.lower())
     return found
 
-def pace_sides():
+def parse_since(text):
+    """A local clock time such as 4:40PM, 4:40:05 PM, or 16:40. Today, or yesterday if that clock time is still ahead."""
+    compact = "".join(text.strip().upper().split())
+    clock = None
+    for fmt in ("%I:%M%p", "%I:%M:%S%p", "%H:%M", "%H:%M:%S"):
+        try:
+            clock = datetime.strptime(compact, fmt)
+            break
+        except ValueError:
+            continue
+    if clock is None:
+        raise SystemExit(f"throughput: could not read time {text!r} (example: 4:40PM)")
+    now = datetime.now(TZ)
+    since = now.replace(hour=clock.hour, minute=clock.minute, second=clock.second, microsecond=0)
+    if since > now + timedelta(minutes=2):
+        since -= timedelta(days=1)
+    return since
+
+SINCE = parse_since(SINCE_TEXT) if MODE == "since" else None
+
+def pace_sides(since=None):
     """Last transfer side seen for each workload, from the worker journal."""
+    journal_since = "6 hours ago"
+    if since is not None:
+        journal_since = since.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     try:
         proc = subprocess.run(
-            ["journalctl", "-u", "beam-worker", "--since", "6 hours ago", "-o", "cat", "-g", "transfer pace"],
+            ["journalctl", "-u", "beam-worker", "--since", journal_since, "-o", "cat", "-g", "transfer pace"],
             capture_output=True, text=True, timeout=8,
         )
     except (OSError, subprocess.SubprocessError):
@@ -522,19 +548,42 @@ def print_rows(rows):
         return
     print(
         f"  {'KIND':<32} {'STATE':<10} {'SIZE':>10} {'TIME':>8} {'RATE':>10}  "
-        f"{'REGION':<14} {'UPLOAD':<10} {'STOP':<18} {'SLOW'}"
+        f"{'TIME STARTED':>12}  {'REGION':<14} {'UPLOAD':<10} {'STOP':<18} {'SLOW'}"
     )
-    print("  " + "-" * 132)
+    print("  " + "-" * 146)
     for row in rows:
         line = (
             f"  {row['kind']:<32} {row['state']:<10} {fmt_mib(row['bytes']):>10} "
             f"{fmt_secs(row['seconds']):>8} {fmt_rate(row['mib_s']):>10}  "
+            f"{local_clock(row.get('started')):>12}  "
             f"{(row.get('region') or '—'):<14} {(row.get('upload') or '—'):<10} "
             f"{(row.get('stop') or '—'):<18} {row.get('slow') or '—'}"
         )
         if row["state"] != "completed" and not row["in_flight"]:
             line = emphasize(line)
         print(line)
+
+def from_time(rows, since):
+    chosen = []
+    for row in rows:
+        stamps = [row.get("created"), row.get("updated"), row.get("started"), row.get("ended")]
+        if any(stamp is not None and stamp >= since for stamp in stamps):
+            chosen.append(row)
+    return chosen
+
+def print_since(rows, since):
+    chosen = from_time(rows, since)
+    chosen.sort(key=lambda row: row["updated"] or row["created"] or datetime.fromtimestamp(0, tz=timezone.utc), reverse=True)
+    states = defaultdict(int)
+    for row in chosen:
+        states[row["state"]] += 1
+    counts = "   ".join(f"{name} {states[name]}" for name in ("completed", "cancelled", "failed", "rejected", "running") if states.get(name))
+    print(f"\nFROM   {local_clock(since)}   {len(chosen)} tasks")
+    if counts:
+        print(f"       {counts}")
+    print()
+    print_rows(chosen)
+    return chosen
 
 def print_wave(rows):
     wave = last_wave(rows)
@@ -690,14 +739,18 @@ def print_emission(row):
 def render(show_all):
     tasks = fetch_tasks()
     write_unsuccessful(tasks)
-    sides = pace_sides()
+    sides = pace_sides(SINCE)
     prelim = [enrich(task, {}, sides) for task in tasks]
     medians = medians_of(prelim)
     rows = [enrich(task, medians, sides) for task in tasks]
     rows.sort(key=lambda row: row["updated"] or datetime.fromtimestamp(0, tz=timezone.utc), reverse=True)
 
     print_emission(emission())
-    print_stop_legend(print_wave(rows))
+    if SINCE is not None:
+        shown = print_since(rows, SINCE)
+    else:
+        shown = print_wave(rows)
+    print_stop_legend(shown)
     if show_all:
         print(f"\nALL TASKS  {len(rows)}")
         print_rows(rows)

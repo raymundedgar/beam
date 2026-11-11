@@ -1,0 +1,11 @@
+[Unit]
+Description=Alert when subnet 105 registration is cheap or the hotkey is purged
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/beam
+ExecStart=/usr/bin/python3 /root/beam/scripts/regcost-alert.py
+TimeoutStartSec=180
+Nice=10
