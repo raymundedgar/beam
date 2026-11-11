@@ -164,21 +164,16 @@ func overlapReady(buf *followBuffer, started time.Time, total int64) bool {
 		return false
 	}
 	elapsed := time.Since(started)
-	early := hedgeAfter / 2
-	if early < time.Millisecond {
-		early = hedgeAfter
-	}
-	if elapsed < early {
-		return false
-	}
 	if mostlyReceived(n, total) {
 		return true
 	}
-	budget := sourceBudget
+	// The download watcher makes its keep-or-replace decision at hedgeAfter,
+	// against sourceBudget. Starting earlier uses a looser test and opens an
+	// upload for a read that is about to be discarded.
 	if elapsed < hedgeAfter {
-		budget = sourceBudget * 2
+		return false
 	}
-	return !rateTooSlow(n, total, elapsed, budget, hedgeMinBytes)
+	return !rateTooSlow(n, total, elapsed, sourceBudget, hedgeMinBytes)
 }
 
 type putOutcome struct {
@@ -349,7 +344,8 @@ func (h *Handler) transferOverlapped(ctx context.Context, part contracts.Transfe
 			// A terminal upload error before the download finishes is still
 			// the upload's answer when no later read replaces it.
 			if mine == cur {
-				early = &outcome
+				saved := outcome
+				early = &saved
 			}
 		}
 	}
