@@ -48,6 +48,13 @@ var errReplaced = errors.New("slow source connection closed")
 // continuation. It is not an upload discard and does not use the discard cap.
 var errSourceReset = errors.New("source reset")
 
+// errReadRetry repeats the signed GET after a valid 206 dropped mid-body.
+// The buffered prefix stays, and the upload keeps waiting on it.
+var errReadRetry = errors.New("read retry")
+
+// errETagMismatch is a part ETag that is not the MD5 of the bytes sent.
+var errETagMismatch = errors.New("etag mismatch")
+
 // tooSlow reports that moved bytes cannot reach total inside budget at the
 // rate observed over elapsed. A finished body is never slow.
 func tooSlow(moved, total int64, elapsed, budget time.Duration) bool {

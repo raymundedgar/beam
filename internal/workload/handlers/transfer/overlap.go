@@ -147,6 +147,7 @@ type followReader struct {
 	ctx     context.Context
 	off     int
 	waiting atomic.Bool
+	waited  atomic.Int64
 }
 
 func (r *followReader) Read(p []byte) (int, error) {
@@ -175,9 +176,11 @@ func (r *followReader) Read(p []byte) (int, error) {
 			return 0, err
 		}
 		r.waiting.Store(true)
+		stopped := time.Now()
 		stop := context.AfterFunc(r.ctx, func() { r.b.cond.Broadcast() })
 		r.b.cond.Wait()
 		stop()
+		r.waited.Add(int64(time.Since(stopped)))
 	}
 }
 
@@ -190,6 +193,13 @@ func (r *followReader) starved() bool {
 	r.b.mu.Lock()
 	defer r.b.mu.Unlock()
 	return r.b.err == nil && !r.b.done && r.off >= len(r.b.buf)
+}
+
+func (r *followReader) starvedFor() time.Duration {
+	if r == nil {
+		return 0
+	}
+	return time.Duration(r.waited.Load())
 }
 
 // overlapReady reports that this download is worth an upload slot. A read the

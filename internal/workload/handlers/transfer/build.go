@@ -26,8 +26,8 @@ func init() {
 }
 
 func policyStamp() string {
-	return fmt.Sprintf("build=%s read_median=%t read_restarts=%d put_policy=%t put_discards=%d put_late=%t early_put=%t",
-		buildID, readMedian, readRestartCap, putPolicy, putDiscardCap(), putLateProbe, earlyPut)
+	return fmt.Sprintf("build=%s read_median=%t read_restarts=%d reset_no_etag=%t put_policy=%t put_discards=%d put_etag_strict=%t put_late=%t early_put=%t",
+		buildID, readMedian, readRestartCap, readResetNoETag, putPolicy, putDiscardCap(), putETagStrict, putLateProbe, earlyPut)
 }
 
 var policyOnce sync.Once

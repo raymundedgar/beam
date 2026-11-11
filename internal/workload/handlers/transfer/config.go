@@ -43,6 +43,12 @@ var (
 	readMedian       = true
 	readRestartCap   = 10
 	readMedianFactor = 1.5
+	// readResetNoETag resets the upload when a 206 drops and the response had
+	// no ETag. A matching ETag keeps the prefix either way.
+	readResetNoETag = true
+	// putETagStrict fails an upload whose R2 part ETag is not the MD5 of the
+	// bytes sent. Off logs the mismatch and still accepts the 200.
+	putETagStrict = false
 )
 
 func init() {
@@ -53,6 +59,8 @@ func init() {
 	putParallelProbe = envBool("BEAM_WORKER_PUT_PARALLEL_PROBE", false)
 	putLateProbe = envBool("BEAM_WORKER_PUT_LATE_PROBE", false)
 	readMedian = envBool("BEAM_WORKER_READ_MEDIAN", true)
+	readResetNoETag = envBool("BEAM_WORKER_READ_RESET_NO_ETAG", true)
+	putETagStrict = envBool("BEAM_WORKER_PUT_ETAG_STRICT", false)
 	if raw := os.Getenv("BEAM_WORKER_READ_RESTARTS"); raw != "" {
 		if parsed, err := strconv.Atoi(raw); err == nil && parsed >= 0 {
 			readRestartCap = parsed

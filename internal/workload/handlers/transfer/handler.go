@@ -407,8 +407,16 @@ func (h *Handler) readSourcePublish(ctx context.Context, part contracts.Transfer
 			return nil, ctx.Err()
 		}
 		lastErr = err
-		if errors.Is(err, errReplaced) {
-			replacements++
+		if errors.Is(err, errReplaced) || errors.Is(err, errReadRetry) {
+			if errors.Is(err, errReadRetry) {
+				traceFrom(ctx).readRetry(bufLen(buf))
+				httpAttempts++
+				if httpAttempts >= presignedAttempts {
+					return nil, err
+				}
+			} else {
+				replacements++
+			}
 			continue
 		}
 		if errors.Is(err, errSourceReset) {
@@ -559,10 +567,34 @@ func (h *Handler) readBody(parent, attempt context.Context, part contracts.Trans
 		traceFrom(parent).stalled(part.Index, "source", int64(len(body)))
 		return nil, errStalled
 	}
+	return nil, classifyShortRead(response.StatusCode, stamp, readErr)
+}
+
+// classifyShortRead keeps a validated 206 prefix when the connection drops.
+// An invalid response, or a 206 with no ETag while that reset is enabled,
+// still aborts the upload.
+func classifyShortRead(status int, stamp *sourceStamp, readErr error) error {
+	reason := "read_error"
 	if readErr == nil || errors.Is(readErr, io.EOF) || errors.Is(readErr, io.ErrUnexpectedEOF) {
-		return nil, &resetError{reason: "short_body"}
+		reason = "short_body"
 	}
-	return nil, &resetError{reason: "read_error"}
+	if status == http.StatusPartialContent && stamp != nil && stamp.set {
+		if stamp.etag != "" {
+			return errReadRetry
+		}
+		if !readResetNoETag {
+			return errReadRetry
+		}
+		return &resetError{reason: "no_etag"}
+	}
+	return &resetError{reason: reason}
+}
+
+func bufLen(buf *followBuffer) int64 {
+	if buf == nil {
+		return 0
+	}
+	return buf.Len()
 }
 
 // uploadRef returns a short hash of the multipart upload id and the part
@@ -607,9 +639,11 @@ func (h *Handler) putPresigned(ctx context.Context, part contracts.TransferPart,
 func (h *Handler) putStream(ctx context.Context, part contracts.TransferPart, open bodyOpen, size int64, digest string) (partResult, error) {
 	// Waiting here, instead of starting every PUT in the wave, keeps each
 	// upload on a connection that can finish.
+	slotBegan := time.Now()
 	if err := h.acquireUpload(ctx); err != nil {
 		return partResult{bytes: size}, err
 	}
+	traceFrom(ctx).addSlotWait(time.Since(slotBegan))
 	defer h.releaseUpload()
 	if putParallelProbe && size >= hedgeMinBytes {
 		return h.putParallel(ctx, part, open, size, digest)
@@ -629,6 +663,7 @@ func (h *Handler) putStream(ctx context.Context, part contracts.TransferPart, op
 		})
 	}
 	replaced := 0
+	etagTries := 0
 	pace := &putPace{}
 	var waiting atomic.Bool
 	open = wrapStarved(open, &waiting)
@@ -644,6 +679,10 @@ func (h *Handler) putStream(ctx context.Context, part contracts.TransferPart, op
 			return result, err
 		}
 		result, err := h.putPresignedOnce(ctx, part, open, size, digest, allow, nil, pace, nil)
+		if putETagStrict && errors.Is(err, errETagMismatch) && etagTries == 0 {
+			etagTries++
+			result, err = h.putPresignedOnce(ctx, part, open, size, digest, allow, nil, pace, nil)
+		}
 		if errors.Is(err, errReplaced) {
 			replaced++
 		}
@@ -783,8 +822,14 @@ func (h *Handler) putPresignedOnce(ctx context.Context, part contracts.TransferP
 	attemptCtx, cancel := context.WithCancelCause(ctx)
 	defer cancel(context.Canceled)
 	reader, paused := open(attemptCtx)
+	starvedReader, _ := reader.(*followReader)
 	sentMD5 := md5.New()
 	counter := &byteCounter{r: io.TeeReader(reader, sentMD5), onFirst: func() { traceFrom(ctx).moved(part.Index, "destination") }}
+	defer func() {
+		if starvedReader != nil {
+			traceFrom(ctx).addSlotStarved(starvedReader.starvedFor())
+		}
+	}()
 	var held atomic.Value
 	var ackBytes atomic.Int64
 	var ackSeen atomic.Bool
@@ -911,7 +956,11 @@ func (h *Handler) putPresignedOnce(ctx context.Context, part contracts.TransferP
 	case drop:
 		reason = "slow"
 	}
-	traceFrom(ctx).putAttempt(remoteIP(conn), cfColo(destinationResponse.Header), bucketOf(part.Destination.URL), uploadID, partNo, reason, snap, acked)
+	starvedFor := time.Duration(0)
+	if starvedReader != nil {
+		starvedFor = starvedReader.starvedFor()
+	}
+	traceFrom(ctx).putAttempt(remoteIP(conn), cfColo(destinationResponse.Header), bucketOf(part.Destination.URL), uploadID, partNo, reason, snap, acked, starvedFor)
 	releaseResponse(destinationResponse, conn, drop)
 	if destinationResponse.StatusCode < 200 || destinationResponse.StatusCode >= 300 {
 		return partResult{bytes: size}, &statusError{label: "destination", status: destinationResponse.StatusCode}
@@ -919,8 +968,11 @@ func (h *Handler) putPresignedOnce(ctx context.Context, part contracts.TransferP
 	etag := strings.Trim(destinationResponse.Header.Get("ETag"), `"`)
 	sent := hex.EncodeToString(sentMD5.Sum(nil))
 	if etag != "" && !strings.Contains(etag, "-") && !strings.EqualFold(etag, sent) {
-		log.Printf("ERROR transfer etag_mismatch workload part upload=%s part_no=%s etag=%s md5=%s", uploadID, partNo, etag, sent)
+		log.Printf("ERROR transfer etag_mismatch upload=%s part_no=%s etag=%s md5=%s", uploadID, partNo, etag, sent)
 		traceFrom(ctx).etagMismatch(uploadID, partNo, etag, sent)
+		if putETagStrict {
+			return partResult{bytes: size, sha256: digest, etag: etag}, errETagMismatch
+		}
 	}
 	return partResult{
 		bytes: size, sha256: digest,

@@ -173,15 +173,17 @@ func enterTransfer() int32 { return activeTransfers.Add(1) }
 func leaveTransfer() { activeTransfers.Add(-1) }
 
 type transferLog struct {
-	workload string
-	attempt  string
-	started  time.Time
-	once     sync.Once
-	printf   func(string, ...any)
-	mu       sync.Mutex
-	firstAt  time.Time
-	putAt    time.Time
-	ackAt    time.Time
+	workload    string
+	attempt     string
+	started     time.Time
+	once        sync.Once
+	printf      func(string, ...any)
+	mu          sync.Mutex
+	firstAt     time.Time
+	putAt       time.Time
+	ackAt       time.Time
+	slotWait    time.Duration
+	slotStarved time.Duration
 }
 
 func (t *transferLog) out(format string, args ...any) {
@@ -282,6 +284,31 @@ func (t *transferLog) readMedianEmpty(host string) {
 		t.workload, t.attempt, host, buildID)
 }
 
+func (t *transferLog) addSlotWait(d time.Duration) {
+	if t == nil || d < 0 {
+		return
+	}
+	t.mu.Lock()
+	t.slotWait += d
+	t.mu.Unlock()
+}
+
+func (t *transferLog) addSlotStarved(d time.Duration) {
+	if t == nil || d <= 0 {
+		return
+	}
+	t.mu.Lock()
+	t.slotStarved += d
+	t.mu.Unlock()
+}
+
+func (t *transferLog) readRetry(n int64) {
+	if t == nil {
+		return
+	}
+	t.out("transfer read_retry workload=%s attempt=%s bytes=%d build=%s", t.workload, t.attempt, n, buildID)
+}
+
 func (t *transferLog) sourceReset(reason string) {
 	if t == nil {
 		return
@@ -304,13 +331,13 @@ func (t *transferLog) readSkip(n int64) {
 	t.out("transfer read_skip workload=%s attempt=%s bytes=%d build=%s", t.workload, t.attempt, n, buildID)
 }
 
-func (t *transferLog) putAttempt(remote, colo, bucket, upload, part, reason string, snap tcpSnap, acked int64) {
+func (t *transferLog) putAttempt(remote, colo, bucket, upload, part, reason string, snap tcpSnap, acked int64, starved time.Duration) {
 	if t == nil {
 		return
 	}
-	t.out("transfer put_attempt workload=%s attempt=%s remote=%s colo=%s rtt_us=%d cwnd=%d retrans=%d delivery_rate=%d rwnd_limited_us=%d sndbuf_limited_us=%d sndbuf=%d acked=%d bucket=%s upload=%s part_no=%s reason=%s",
+	t.out("transfer put_attempt workload=%s attempt=%s remote=%s colo=%s rtt_us=%d cwnd=%d retrans=%d delivery_rate=%d rwnd_limited_us=%d sndbuf_limited_us=%d sndbuf=%d acked=%d slot_starved=%s bucket=%s upload=%s part_no=%s reason=%s",
 		t.workload, t.attempt, remote, colo, snap.rttUs, snap.cwnd, snap.retrans, snap.deliveryRate,
-		snap.rwndLimited, snap.sndbufLimited, snap.sndbuf, acked, bucket, upload, part, reason)
+		snap.rwndLimited, snap.sndbufLimited, snap.sndbuf, acked, starved.Round(time.Millisecond), bucket, upload, part, reason)
 }
 
 func (t *transferLog) putProbe(kept int, rateA, rateB int64) {
@@ -329,6 +356,7 @@ func (t *transferLog) reported(batch string, leader, cut bool) {
 	}
 	t.mu.Lock()
 	first, putAt, ackAt := t.firstAt, t.putAt, t.ackAt
+	slotWait, slotStarved := t.slotWait, t.slotStarved
 	t.mu.Unlock()
 	ttfb, putStart, ack := time.Duration(-1), time.Duration(-1), time.Duration(-1)
 	if !first.IsZero() {
@@ -343,9 +371,10 @@ func (t *transferLog) reported(batch string, leader, cut bool) {
 	if batch == "" {
 		batch = "-"
 	}
-	t.out("transfer report workload=%s attempt=%s batch=%s first_deliverer=%t ttfb=%s put_start=%s ack=%s result=%s cut=%t %s",
+	t.out("transfer report workload=%s attempt=%s batch=%s first_deliverer=%t ttfb=%s put_start=%s ack=%s result=%s cut=%t slot_wait=%s slot_starved=%s %s",
 		t.workload, t.attempt, batch, leader,
-		reportDur(ttfb), reportDur(putStart), reportDur(ack), time.Since(t.started).Round(time.Millisecond), cut, policyStamp())
+		reportDur(ttfb), reportDur(putStart), reportDur(ack), time.Since(t.started).Round(time.Millisecond), cut,
+		slotWait.Round(time.Millisecond), slotStarved.Round(time.Millisecond), policyStamp())
 }
 
 func reportDur(d time.Duration) string {
