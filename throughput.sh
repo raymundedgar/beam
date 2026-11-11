@@ -303,7 +303,54 @@ def kind_of(task):
         return f"{base}/{src}"
     return f"{base}/{src}>{dst}"
 
-def enrich(task, medians):
+def workload_ids(task):
+    found = []
+    for raw in (task.get("external_id"), task.get("workload_key")):
+        if not isinstance(raw, str):
+            continue
+        for part in raw.split("/"):
+            part = part.strip().lower()
+            if len(part) >= 8 and part not in found:
+                found.append(part)
+    result = task.get("result") if isinstance(task.get("result"), dict) else {}
+    wid = result.get("workload_id") if isinstance(result, dict) else None
+    if isinstance(wid, str) and len(wid) >= 8 and wid.lower() not in found:
+        found.append(wid.lower())
+    return found
+
+def pace_sides():
+    """Last transfer side seen for each workload, from the worker journal."""
+    try:
+        proc = subprocess.run(
+            ["journalctl", "-u", "beam-worker", "--since", "6 hours ago", "-o", "cat", "-g", "transfer pace"],
+            capture_output=True, text=True, timeout=8,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return {}
+    if proc.returncode != 0:
+        return {}
+    sides = {}
+    for line in proc.stdout.splitlines():
+        workload = re.search(r"workload=([0-9a-f-]{8,})", line)
+        side = re.search(r"side=(source|destination)", line)
+        if not workload or not side:
+            continue
+        key = workload.group(1).lower()
+        sides[key] = "download" if side.group(1) == "source" else "upload"
+        sides[key[:8]] = sides[key]
+    return sides
+
+def slow_side(task, sides):
+    if (task.get("state") or "") != "cancelled":
+        return "—"
+    for key in workload_ids(task):
+        if key in sides:
+            return sides[key]
+        if key[:8] in sides:
+            return sides[key[:8]]
+    return "—"
+
+def enrich(task, medians, sides):
     kind = kind_of(task)
     state = task.get("state") or "-"
     nbytes = task_bytes(task)
@@ -329,6 +376,7 @@ def enrich(task, medians):
         "stop": stop_reason(task),
         "region": regions_of(task),
         "upload": upload_of(task),
+        "slow": slow_side(task, sides),
     }
 
 def medians_of(rows):
@@ -474,16 +522,15 @@ def print_rows(rows):
         return
     print(
         f"  {'KIND':<32} {'STATE':<10} {'SIZE':>10} {'TIME':>8} {'RATE':>10}  "
-        f"{'REGION':<14} {'UPLOAD':<10} {'STOP':<18} {'START':<12} {'END'}"
+        f"{'REGION':<14} {'UPLOAD':<10} {'STOP':<18} {'SLOW'}"
     )
-    print("  " + "-" * 142)
+    print("  " + "-" * 132)
     for row in rows:
         line = (
             f"  {row['kind']:<32} {row['state']:<10} {fmt_mib(row['bytes']):>10} "
             f"{fmt_secs(row['seconds']):>8} {fmt_rate(row['mib_s']):>10}  "
             f"{(row.get('region') or '—'):<14} {(row.get('upload') or '—'):<10} "
-            f"{(row.get('stop') or '—'):<18} {local_clock(row.get('started')):<12} "
-            f"{local_clock(row.get('ended'))}"
+            f"{(row.get('stop') or '—'):<18} {row.get('slow') or '—'}"
         )
         if row["state"] != "completed" and not row["in_flight"]:
             line = emphasize(line)
@@ -643,9 +690,10 @@ def print_emission(row):
 def render(show_all):
     tasks = fetch_tasks()
     write_unsuccessful(tasks)
-    prelim = [enrich(task, {}) for task in tasks]
+    sides = pace_sides()
+    prelim = [enrich(task, {}, sides) for task in tasks]
     medians = medians_of(prelim)
-    rows = [enrich(task, medians) for task in tasks]
+    rows = [enrich(task, medians, sides) for task in tasks]
     rows.sort(key=lambda row: row["updated"] or datetime.fromtimestamp(0, tz=timezone.utc), reverse=True)
 
     print_emission(emission())
