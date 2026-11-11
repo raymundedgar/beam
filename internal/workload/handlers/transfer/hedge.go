@@ -157,7 +157,7 @@ func replaceSlowUpload(ctx context.Context, replaced int) bool {
 // object. acked reports TCP bytes_acked. A nil cancel only records samples,
 // so the final attempt is still visible in the pace line. An upload that has
 // already acknowledged putAckKeep, or half the object, is kept.
-func watchPutAck(ctx context.Context, cancel context.CancelCauseFunc, written *atomic.Int64, total int64, quiet time.Duration, minRate int64, acked func() (int64, bool), onStall func(written, acked int64)) {
+func watchPutAck(ctx context.Context, cancel context.CancelCauseFunc, written *atomic.Int64, total int64, quiet time.Duration, minRate int64, acked func() (int64, bool), onStall func(written, acked int64), paused func() bool) {
 	if quiet <= 0 || acked == nil {
 		return
 	}
@@ -193,6 +193,13 @@ func watchPutAck(ctx context.Context, cancel context.CancelCauseFunc, written *a
 			if n != last {
 				last = n
 				lastMove = now
+			}
+			// An overlapped upload stops sending while the download has not
+			// produced the next bytes. That gap is not a slow socket.
+			if paused != nil && paused() {
+				lastMove = now
+				base, baseAt = n, now
+				continue
 			}
 			progress := n - base
 			// The body can sit fully queued in a 16 MB window while the peer

@@ -150,7 +150,7 @@ func TestPutAckStallReplacesAFrozenPeer(t *testing.T) {
 	written.Store(8 << 20)
 	go watchPutAck(ctx, cancel, &written, 50<<20, 40*time.Millisecond, 3<<20, func() (int64, bool) {
 		return 1000, true
-	}, nil)
+	}, nil, nil)
 	select {
 	case <-ctx.Done():
 		if context.Cause(ctx) != errReplaced {
@@ -170,7 +170,7 @@ func TestPutAckProgressAndHalfwayAreKept(t *testing.T) {
 	go watchPutAck(ctx, cancel, &written, 50<<20, 30*time.Millisecond, 3<<20, func() (int64, bool) {
 		acked += 1 << 20
 		return acked, true
-	}, nil)
+	}, nil, nil)
 	select {
 	case <-ctx.Done():
 		if context.Cause(ctx) == errReplaced {
@@ -187,7 +187,7 @@ func TestPutAckProgressAndHalfwayAreKept(t *testing.T) {
 			return 1000, true
 		}
 		return 30 << 20, true
-	}, nil)
+	}, nil, nil)
 	select {
 	case <-halfCtx.Done():
 		if context.Cause(halfCtx) == errReplaced {
@@ -235,7 +235,7 @@ func TestFrozenTailAfterTheBufferFillsIsReplaced(t *testing.T) {
 			return 1000, true
 		}
 		return 20 << 20, true
-	}, nil)
+	}, nil, nil)
 	select {
 	case <-ctx.Done():
 		if context.Cause(ctx) != errReplaced {
@@ -253,7 +253,7 @@ func TestFrozenTailAfterTheBufferFillsIsReplaced(t *testing.T) {
 			return 1000, true
 		}
 		return (50 << 20) + 1000, true
-	}, nil)
+	}, nil, nil)
 	select {
 	case <-doneCtx.Done():
 		if context.Cause(doneCtx) == errReplaced {
@@ -275,7 +275,7 @@ func TestProvenUploadSurvivesAShortTailPause(t *testing.T) {
 			return 1000, true
 		}
 		return 30 << 20, true
-	}, nil)
+	}, nil, nil)
 	select {
 	case <-ctx.Done():
 		if context.Cause(ctx) == errReplaced {
@@ -313,7 +313,7 @@ func TestSlowAckRateIsReplaced(t *testing.T) {
 	go watchPutAck(ctx, cancel, &written, 50<<20, 30*time.Millisecond, 3<<20, func() (int64, bool) {
 		n.Add(1000)
 		return n.Load(), true
-	}, nil)
+	}, nil, nil)
 	select {
 	case <-ctx.Done():
 		if context.Cause(ctx) != errReplaced {

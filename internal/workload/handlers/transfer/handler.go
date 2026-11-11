@@ -338,6 +338,11 @@ func (h *Handler) executePart(ctx context.Context, part contracts.TransferPart) 
 	if part.Length > 0 && part.Length <= maxResumablePart {
 		// The slot covers the download only. Holding it through a slow upload
 		// left the rest of the wave waiting until Beam cancelled those offers.
+		// A part whose hash must be checked before the first uploaded byte stays
+		// serial. Everything else can upload once the read is fast enough to keep.
+		if part.ExpectedSHA256 == "" {
+			return h.transferOverlapped(ctx, part)
+		}
 		body, err := h.readSource(ctx, part)
 		h.releaseSlot()
 		if err != nil {
@@ -352,6 +357,10 @@ func (h *Handler) executePart(ctx context.Context, part contracts.TransferPart) 
 }
 
 func (h *Handler) readSource(ctx context.Context, part contracts.TransferPart) ([]byte, error) {
+	return h.readSourcePublish(ctx, part, nil)
+}
+
+func (h *Handler) readSourcePublish(ctx context.Context, part contracts.TransferPart, publish func(*followBuffer)) ([]byte, error) {
 	var lastErr error
 	httpAttempts := 0
 	replacements := 0
@@ -365,7 +374,19 @@ func (h *Handler) readSource(ctx context.Context, part contracts.TransferPart) (
 		// A slow connection is closed and the signed GET is repeated. Keeping
 		// the slow one, and only one extra, left both near 1 MiB/s until Beam
 		// cancelled the offer.
-		body, err := h.readSourceOnce(ctx, part, replacements < maxSourceReplacements)
+		var buf *followBuffer
+		if publish != nil {
+			buf = newFollowBuffer(part.Length)
+			publish(buf)
+		}
+		body, err := h.readSourceOnce(ctx, part, replacements < maxSourceReplacements, buf)
+		if buf != nil {
+			if err != nil {
+				buf.fail(err)
+			} else {
+				buf.finish()
+			}
+		}
 		if err == nil {
 			return body, nil
 		}
@@ -397,7 +418,7 @@ func (h *Handler) readSource(ctx context.Context, part contracts.TransferPart) (
 	}
 }
 
-func (h *Handler) readSourceOnce(ctx context.Context, part contracts.TransferPart, allowReplace bool) ([]byte, error) {
+func (h *Handler) readSourceOnce(ctx context.Context, part contracts.TransferPart, allowReplace bool, buf *followBuffer) ([]byte, error) {
 	started := time.Now()
 	counter := &byteCounter{onFirst: func() { traceFrom(ctx).moved(part.Index, "source") }}
 	var expected atomic.Int64
@@ -411,7 +432,7 @@ func (h *Handler) readSourceOnce(ctx context.Context, part contracts.TransferPar
 		probe, budget, minBytes := hedgeAfter, sourceBudget, hedgeMinBytes
 		go watchSourceRate(attemptCtx, cancel, &counter.n, part.Length, probe, budget, minBytes)
 	}
-	body, err := h.readBody(ctx, stallCtx, part, counter, started)
+	body, err := h.readBody(ctx, stallCtx, part, counter, started, buf)
 	if ctx.Err() != nil {
 		return nil, ctx.Err()
 	}
@@ -421,7 +442,7 @@ func (h *Handler) readSourceOnce(ctx context.Context, part contracts.TransferPar
 	return body, err
 }
 
-func (h *Handler) readBody(parent, attempt context.Context, part contracts.TransferPart, counter *byteCounter, started time.Time) ([]byte, error) {
+func (h *Handler) readBody(parent, attempt context.Context, part contracts.TransferPart, counter *byteCounter, started time.Time, buf *followBuffer) ([]byte, error) {
 	response, err := h.openSourceFrom(attempt, part, 0, "")
 	if err != nil {
 		traceFrom(parent).pace(part.Index, "source", 0, counter.n.Load(), time.Since(started), counter.blockedFor(), counter.longestGap(), 0, counter.waitedInRead(), part.Source.Region)
@@ -437,9 +458,16 @@ func (h *Handler) readBody(parent, attempt context.Context, part contracts.Trans
 	respWait := time.Since(started)
 	defer response.Body.Close()
 	counter.r = response.Body
-	chunk := make([]byte, part.Length)
-	n, readErr := io.ReadFull(counter, chunk)
-	body := chunk[:n]
+	var body []byte
+	var readErr error
+	if buf == nil {
+		chunk := make([]byte, part.Length)
+		var n int
+		n, readErr = io.ReadFull(counter, chunk)
+		body = chunk[:n]
+	} else {
+		body, readErr = readInto(counter, buf, part.Length, attempt)
+	}
 	traceFrom(parent).pace(part.Index, "source", response.StatusCode, int64(len(body)), time.Since(started), counter.blockedFor(), counter.longestGap(), respWait, counter.waitedInRead(), part.Source.Region)
 	if int64(len(body)) == part.Length {
 		return body, nil
@@ -480,16 +508,27 @@ func uploadRef(raw string) (id, part string) {
 	return hex.EncodeToString(sum[:4]), part
 }
 
+// bodyOpen returns a reader positioned at the first byte and, when the read
+// can block on a download that is still in progress, a flag the acknowledgement
+// watcher treats as "not the socket's fault".
+type bodyOpen func(context.Context) (io.Reader, func() bool)
+
 func (h *Handler) putPresigned(ctx context.Context, part contracts.TransferPart, body []byte) (partResult, error) {
 	sum := sha256.Sum256(body)
 	digest := hex.EncodeToString(sum[:])
 	if part.ExpectedSHA256 != "" && !strings.EqualFold(digest, part.ExpectedSHA256) {
 		return partResult{bytes: int64(len(body)), sha256: digest}, fmt.Errorf("SHA-256 mismatch: got %s", digest)
 	}
-	// The body is already in memory. Waiting here, instead of starting every
-	// PUT in the wave, keeps each upload on a connection that can finish.
+	return h.putStream(ctx, part, func(context.Context) (io.Reader, func() bool) {
+		return bytes.NewReader(body), nil
+	}, int64(len(body)), digest)
+}
+
+func (h *Handler) putStream(ctx context.Context, part contracts.TransferPart, open bodyOpen, size int64, digest string) (partResult, error) {
+	// Waiting here, instead of starting every PUT in the wave, keeps each
+	// upload on a connection that can finish.
 	if err := h.acquireUpload(ctx); err != nil {
-		return partResult{bytes: int64(len(body))}, err
+		return partResult{bytes: size}, err
 	}
 	defer h.releaseUpload()
 	replaced := 0
@@ -499,12 +538,12 @@ func (h *Handler) putPresigned(ctx context.Context, part contracts.TransferPart,
 		// acknowledgement floor halfway through the probe, and only while two
 		// discards remain. Fast uploads never open it. The last attempt stays
 		// single so a path that is slow on every socket still delivers.
-		if allow && int64(len(body)) >= hedgeMinBytes && replaceSlowUpload(ctx, replaced+1) {
-			result, err, used := h.putPresignedHedged(ctx, part, body, digest)
+		if allow && size >= hedgeMinBytes && replaceSlowUpload(ctx, replaced+1) {
+			result, err, used := h.putPresignedHedged(ctx, part, open, size, digest)
 			replaced += used
 			return result, err
 		}
-		result, err := h.putPresignedOnce(ctx, part, body, digest, allow, nil)
+		result, err := h.putPresignedOnce(ctx, part, open, size, digest, allow, nil)
 		if errors.Is(err, errReplaced) {
 			replaced++
 		}
@@ -516,7 +555,7 @@ func (h *Handler) putPresigned(ctx context.Context, part contracts.TransferPart,
 // minimum rate by half the probe, starts a second with the same bytes. Either
 // acceptance cancels the other. A discard from the slow socket does not cancel
 // the one that is still running. used counts connections that were discarded.
-func (h *Handler) putPresignedHedged(ctx context.Context, part contracts.TransferPart, body []byte, digest string) (partResult, error, int) {
+func (h *Handler) putPresignedHedged(ctx context.Context, part contracts.TransferPart, open bodyOpen, size int64, digest string) (partResult, error, int) {
 	attemptCtx, cancel := context.WithCancelCause(ctx)
 	defer cancel(context.Canceled)
 	type outcome struct {
@@ -526,7 +565,7 @@ func (h *Handler) putPresignedHedged(ctx context.Context, part contracts.Transfe
 	ch := make(chan outcome, 2)
 	var progress atomic.Int64
 	go func() {
-		result, err := h.putPresignedOnce(attemptCtx, part, body, digest, true, &progress)
+		result, err := h.putPresignedOnce(attemptCtx, part, open, size, digest, true, &progress)
 		ch <- outcome{result, err}
 	}()
 	hedgeAt := putAckQuiet / 2
@@ -556,7 +595,7 @@ func (h *Handler) putPresignedHedged(ctx context.Context, part contracts.Transfe
 			}
 			pending++
 			go func() {
-				result, err := h.putPresignedOnce(attemptCtx, part, body, digest, true, nil)
+				result, err := h.putPresignedOnce(attemptCtx, part, open, size, digest, true, nil)
 				ch <- outcome{result, err}
 			}()
 		case o := <-ch:
@@ -616,15 +655,16 @@ func (h *Handler) retryPresigned(ctx context.Context, attemptFn func() (partResu
 	}
 }
 
-func (h *Handler) putPresignedOnce(ctx context.Context, part contracts.TransferPart, body []byte, digest string, allowReplace bool, progress *atomic.Int64) (partResult, error) {
+func (h *Handler) putPresignedOnce(ctx context.Context, part contracts.TransferPart, open bodyOpen, size int64, digest string, allowReplace bool, progress *atomic.Int64) (partResult, error) {
 	destinationMethod := strings.ToUpper(strings.TrimSpace(part.Destination.Method))
 	if destinationMethod == "" {
 		destinationMethod = http.MethodPut
 	}
 	started := time.Now()
-	counter := &byteCounter{r: bytes.NewReader(body), onFirst: func() { traceFrom(ctx).moved(part.Index, "destination") }}
 	attemptCtx, cancel := context.WithCancelCause(ctx)
 	defer cancel(context.Canceled)
+	reader, paused := open(attemptCtx)
+	counter := &byteCounter{r: reader, onFirst: func() { traceFrom(ctx).moved(part.Index, "destination") }}
 	var held atomic.Value
 	var ackBytes atomic.Int64
 	var ackSeen atomic.Bool
@@ -632,9 +672,9 @@ func (h *Handler) putPresignedOnce(ctx context.Context, part contracts.TransferP
 	var ackBase atomic.Int64
 	ackMoved.Store(time.Now().UnixNano())
 	uploadID, partNo := uploadRef(part.Destination.URL)
-	if int64(len(body)) >= hedgeMinBytes {
+	if size >= hedgeMinBytes {
 		quiet, minRate := putAckQuiet, putAckMinRate
-		total := int64(len(body))
+		total := size
 		var stallCancel context.CancelCauseFunc
 		if allowReplace {
 			stallCancel = cancel
@@ -665,7 +705,7 @@ func (h *Handler) putPresignedOnce(ctx context.Context, part contracts.TransferP
 			return n, true
 		}, func(written, acked int64) {
 			traceFrom(ctx).replaced(part.Index, "destination", "ack_stall", written, acked)
-		})
+		}, paused)
 	}
 	destinationRequest, err := http.NewRequestWithContext(attemptCtx, destinationMethod, part.Destination.URL, counter)
 	if err != nil {
@@ -682,7 +722,7 @@ func (h *Handler) putPresignedOnce(ctx context.Context, part contracts.TransferP
 	if destinationRequest.Header.Get("Content-Type") == "" {
 		destinationRequest.Header.Set("Content-Type", "application/octet-stream")
 	}
-	destinationRequest.ContentLength = int64(len(body))
+	destinationRequest.ContentLength = size
 	destinationResponse, err := h.client.Do(destinationRequest)
 	respWait := time.Duration(0)
 	if !counter.last.IsZero() {
@@ -702,20 +742,20 @@ func (h *Handler) putPresignedOnce(ctx context.Context, part contracts.TransferP
 	traceFrom(ctx).pacePut(part.Index, statusCode(destinationResponse), counter.n.Load(), time.Since(started), counter.blockedFor(), counter.longestGap(), respWait, counter.waitedInRead(), acked, ackSeen.Load(), ackAge, uploadID, partNo, part.Destination.Region)
 	if err != nil {
 		if ctx.Err() != nil {
-			return partResult{bytes: int64(len(body))}, ctx.Err()
+			return partResult{bytes: size}, ctx.Err()
 		}
 		if context.Cause(attemptCtx) == errReplaced {
 			return partResult{bytes: counter.n.Load()}, errReplaced
 		}
-		return partResult{bytes: int64(len(body))}, fmt.Errorf("write destination: %w", err)
+		return partResult{bytes: size}, fmt.Errorf("write destination: %w", err)
 	}
 	defer destinationResponse.Body.Close()
 	_, _ = io.Copy(io.Discard, io.LimitReader(destinationResponse.Body, defaultResponseBodyLimit))
 	if destinationResponse.StatusCode < 200 || destinationResponse.StatusCode >= 300 {
-		return partResult{bytes: int64(len(body))}, &statusError{label: "destination", status: destinationResponse.StatusCode}
+		return partResult{bytes: size}, &statusError{label: "destination", status: destinationResponse.StatusCode}
 	}
 	return partResult{
-		bytes: int64(len(body)), sha256: digest,
+		bytes: size, sha256: digest,
 		etag: strings.Trim(destinationResponse.Header.Get("ETag"), `"`),
 	}, nil
 }
