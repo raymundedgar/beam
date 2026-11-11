@@ -357,6 +357,13 @@ func (t *transferLog) putProbe(kept int, rateA, rateB int64) {
 		t.workload, t.attempt, kept, rateA, rateB)
 }
 
+func (t *transferLog) readRace(winner int, lens []int64) {
+	if t == nil {
+		return
+	}
+	t.out("transfer read_race workload=%s attempt=%s kept=%d bytes=%v", t.workload, t.attempt, winner, lens)
+}
+
 func (t *transferLog) hedgeRead(kept int, first, second int64) {
 	t.out("transfer hedge_read workload=%s attempt=%s kept=%d bytes0=%d bytes1=%d",
 		t.workload, t.attempt, kept, first, second)

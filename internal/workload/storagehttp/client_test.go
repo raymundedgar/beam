@@ -1,8 +1,10 @@
 package storagehttp
 
 import (
+	"context"
 	"errors"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
@@ -146,6 +148,45 @@ func TestNewClientPoolsManyIdleConnectionsPerHost(t *testing.T) {
 	transport := NewClient(time.Second).Transport.(*http.Transport)
 	if transport.MaxIdleConnsPerHost < 64 || transport.MaxIdleConns < transport.MaxIdleConnsPerHost {
 		t.Fatalf("storage client idle pool is too small: idle=%d per_host=%d", transport.MaxIdleConns, transport.MaxIdleConnsPerHost)
+	}
+}
+
+func TestNewClientResumesTLSSessions(t *testing.T) {
+	transport := NewClient(time.Second).Transport.(*http.Transport)
+	if transport.TLSClientConfig == nil || transport.TLSClientConfig.ClientSessionCache == nil {
+		t.Fatal("storage client has no TLS session cache")
+	}
+}
+
+func TestDialPinRewritesTheAddress(t *testing.T) {
+	if got := rewriteDialAddr("example.com:443", "2606:4700:113::1"); got != "[2606:4700:113::1]:443" {
+		t.Fatalf("got %s", got)
+	}
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	accepted := make(chan struct{}, 1)
+	go func() {
+		c, err := ln.Accept()
+		if err == nil {
+			accepted <- struct{}{}
+			_ = c.Close()
+		}
+	}()
+	client := newClient(2*time.Second, func(netip.AddrPort) bool { return true })
+	_, port, _ := net.SplitHostPort(ln.Addr().String())
+	ctx := WithDialAddr(context.Background(), "127.0.0.1")
+	conn, err := client.Transport.(*http.Transport).DialContext(ctx, "tcp", "example.com:"+port)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = conn.Close()
+	select {
+	case <-accepted:
+	case <-time.After(time.Second):
+		t.Fatal("pinned dial did not reach the listener")
 	}
 }
 

@@ -1,6 +1,7 @@
 package storagehttp
 
 import (
+	"context"
 	"crypto/tls"
 	"errors"
 	"net"
@@ -41,9 +42,18 @@ func newClient(timeout time.Duration, allowed func(netip.AddrPort) bool) *http.C
 			return nil
 		},
 	}
+	baseDial := dialer.DialContext
 	transport := &http.Transport{
-		Proxy:                 nil,
-		DialContext:           dialer.DialContext,
+		Proxy: nil,
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			if pinned, ok := dialAddr(ctx); ok {
+				addr = rewriteDialAddr(addr, pinned)
+			}
+			return baseDial(ctx, network, addr)
+		},
+		TLSClientConfig: &tls.Config{
+			ClientSessionCache: tls.NewLRUClientSessionCache(128),
+		},
 		ForceAttemptHTTP2:     false,
 		TLSNextProto:          map[string]func(authority string, c *tls.Conn) http.RoundTripper{},
 		MaxIdleConns:          4096,
@@ -55,6 +65,30 @@ func newClient(timeout time.Duration, allowed func(netip.AddrPort) bool) *http.C
 		DisableCompression:    true,
 	}
 	return &http.Client{Timeout: timeout, Transport: transport, CheckRedirect: checkRedirect}
+}
+
+type dialPinKey struct{}
+
+// WithDialAddr forces this request's dial onto one resolved address so
+// parallel attempts are not all the first DNS answer.
+func WithDialAddr(ctx context.Context, ip string) context.Context {
+	if ip == "" {
+		return ctx
+	}
+	return context.WithValue(ctx, dialPinKey{}, ip)
+}
+
+func dialAddr(ctx context.Context) (string, bool) {
+	ip, ok := ctx.Value(dialPinKey{}).(string)
+	return ip, ok && ip != ""
+}
+
+func rewriteDialAddr(addr, pinned string) string {
+	_, port, err := net.SplitHostPort(addr)
+	if err != nil || pinned == "" {
+		return addr
+	}
+	return net.JoinHostPort(pinned, port)
 }
 
 func checkRedirect(next *http.Request, via []*http.Request) error {

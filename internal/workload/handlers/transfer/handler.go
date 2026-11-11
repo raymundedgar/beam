@@ -215,6 +215,7 @@ func (h *Handler) Execute(ctx context.Context, spec domain.Spec) (domain.Result,
 	trace := &transferLog{workload: spec.WorkloadID, attempt: spec.AttemptID, started: time.Now(), printf: h.logf}
 	ctx = withTrace(ctx, trace)
 	trace.admitted(len(transfer.Parts))
+	h.warmHosts(ctx, transfer.Parts)
 	leader := true
 	ctx = withLeader(ctx, leader)
 	defer func() {
@@ -368,6 +369,9 @@ func (h *Handler) readSource(ctx context.Context, part contracts.TransferPart) (
 }
 
 func (h *Handler) readSourcePublish(ctx context.Context, part contracts.TransferPart, publish func(*followBuffer)) ([]byte, error) {
+	if readRace {
+		return h.readIPRace(ctx, part, publish, readRaceN, true)
+	}
 	if hedgeRead && isLeader(ctx) {
 		return h.readSourceRace(ctx, part, publish)
 	}

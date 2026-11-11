@@ -11,6 +11,15 @@ import (
 	"time"
 )
 
+func TestWarmSkipsLoopback(t *testing.T) {
+	if warmHost("127.0.0.1:9") || warmHost("::1") || warmHost("-") {
+		t.Fatal("loopback would be pre-dialed")
+	}
+	if !warmHost("example.r2.cloudflarestorage.com") {
+		t.Fatal("a storage host was not pre-dialed")
+	}
+}
+
 func TestIPFamily(t *testing.T) {
 	if ipFamilyOf("172.64.66.1") != "v4" {
 		t.Fatal("v4")

@@ -17,6 +17,11 @@ var (
 	// hedgeRead races two identical signed GETs. Off unless BEAM_WORKER_READ_HEDGE=1.
 	hedgeRead      = false
 	hedgeReadAfter = 1500 * time.Millisecond
+	// readRace opens three GETs on different addresses and keeps the one that
+	// has moved the most. Off unless BEAM_WORKER_READ_RACE=1.
+	readRace  = false
+	readRaceN = 3
+	warmN     = 2
 	// putPolicy judges an upload on the last second of acknowledgements, twice,
 	// and discards at most putMaxDiscards sockets. BEAM_WORKER_PUT_POLICY=0
 	// restores the cumulative rate and the five-discard cap.
@@ -54,6 +59,7 @@ var (
 func init() {
 	earlyPut = envBool("BEAM_WORKER_EARLY_PUT", true)
 	hedgeRead = envBool("BEAM_WORKER_READ_HEDGE", false)
+	readRace = envBool("BEAM_WORKER_READ_RACE", false)
 	putPolicy = envBool("BEAM_WORKER_PUT_POLICY", true)
 	putLinger = envBool("BEAM_WORKER_PUT_LINGER", true)
 	putParallelProbe = envBool("BEAM_WORKER_PUT_PARALLEL_PROBE", false)
