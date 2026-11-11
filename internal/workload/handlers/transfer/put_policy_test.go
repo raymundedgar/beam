@@ -1,0 +1,94 @@
+package transfer
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+	"time"
+)
+
+func TestTwoSlowSecondsDiscardAndOneFastSecondDoesNot(t *testing.T) {
+	var windows ackWindows
+	start := time.Now()
+	if sampled, _, discard := windows.push(start, 0, time.Second, float64(3<<20)); sampled || discard {
+		t.Fatal("the first sample has no window yet")
+	}
+	// 1 MiB in the first second is under 3 MiB/s.
+	sampled, _, discard := windows.push(start.Add(time.Second), 1<<20, time.Second, float64(3<<20))
+	if !sampled || discard {
+		t.Fatalf("sampled=%v discard=%v, one slow second is kept", sampled, discard)
+	}
+	// 4 MiB in the next second clears the streak.
+	if _, _, discard = windows.push(start.Add(2*time.Second), 5<<20, time.Second, float64(3<<20)); discard {
+		t.Fatal("a fast second was discarded")
+	}
+	// Two slow seconds in a row discard. 5 MiB + 1 MiB + 1 MiB.
+	windows.push(start.Add(3*time.Second), 6<<20, time.Second, float64(3<<20))
+	_, _, discard = windows.push(start.Add(4*time.Second), 7<<20, time.Second, float64(3<<20))
+	if !discard {
+		t.Fatal("two consecutive slow seconds were kept")
+	}
+}
+
+func TestSlowerReplacementIsKept(t *testing.T) {
+	var pace putPace
+	pace.discarded(4 << 20)
+	if !pace.notFaster(1 << 20) {
+		t.Fatal("a slower replacement was discarded")
+	}
+	if !pace.stopped() {
+		t.Fatal("discarding continued after a slower replacement")
+	}
+	var faster putPace
+	faster.discarded(1 << 20)
+	if faster.notFaster(4 << 20) {
+		t.Fatal("a faster replacement was kept from being used")
+	}
+}
+
+func TestThrottledUploadSendsTheWholeBody(t *testing.T) {
+	object := bytes.Repeat([]byte{9}, 256<<10)
+	want := sha256.Sum256(object)
+	source := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write(object)
+	}))
+	t.Cleanup(source.Close)
+	dest := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		buf := make([]byte, 4<<10)
+		var got []byte
+		for {
+			n, err := r.Body.Read(buf)
+			if n > 0 {
+				got = append(got, buf[:n]...)
+				time.Sleep(2 * time.Millisecond)
+			}
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				t.Errorf("read: %v", err)
+				return
+			}
+		}
+		sum := sha256.Sum256(got)
+		if sum != want {
+			t.Errorf("uploaded %d bytes", len(got))
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(dest.Close)
+	handler := retryingHandler()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	result, err := handler.Execute(ctx, presignedSpec(t, source.URL, dest.URL, int64(len(object))))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.BytesProcessed != int64(len(object)) {
+		t.Fatalf("bytes=%d", result.BytesProcessed)
+	}
+}

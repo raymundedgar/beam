@@ -8,32 +8,42 @@ import (
 )
 
 func bytesAcked(conn net.Conn) (int64, bool) {
+	snap := readTCP(conn)
+	if !snap.ok {
+		return 0, false
+	}
+	return snap.acked, true
+}
+
+func readTCP(conn net.Conn) tcpSnap {
 	conn = netConn(conn)
 	if conn == nil {
-		return 0, false
+		return tcpSnap{}
 	}
 	raw, ok := conn.(syscall.Conn)
 	if !ok {
-		return 0, false
+		return tcpSnap{}
 	}
 	sys, err := raw.SyscallConn()
 	if err != nil {
-		return 0, false
+		return tcpSnap{}
 	}
-	var acked int64
-	var got bool
+	var snap tcpSnap
 	err = sys.Control(func(fd uintptr) {
 		info, err := unix.GetsockoptTCPInfo(int(fd), unix.IPPROTO_TCP, unix.TCP_INFO)
 		if err != nil || info == nil {
 			return
 		}
-		acked = int64(info.Bytes_acked)
-		got = true
+		snap = tcpSnap{
+			acked: int64(info.Bytes_acked), rttUs: info.Rtt, cwnd: info.Snd_cwnd,
+			retrans: info.Total_retrans, deliveryRate: info.Delivery_rate,
+			rwndLimited: info.Rwnd_limited, sndbufLimited: info.Sndbuf_limited, ok: true,
+		}
 	})
-	if err != nil || !got {
-		return 0, false
+	if err != nil {
+		return tcpSnap{}
 	}
-	return acked, true
+	return snap
 }
 
 func netConn(conn net.Conn) net.Conn {

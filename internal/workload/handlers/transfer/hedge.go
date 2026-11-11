@@ -142,8 +142,18 @@ func mostlyReceived(moved, total int64) bool {
 // new connection. A restart needs the probe interval plus time for a fast
 // copy. Inside that window the current connection is kept so the bytes
 // already sent are not thrown away.
+func putDiscardCap() int {
+	if !putPolicy {
+		return putReplacements
+	}
+	if putMaxDiscards < 0 {
+		return 2
+	}
+	return putMaxDiscards
+}
+
 func replaceSlowUpload(ctx context.Context, replaced int) bool {
-	if replaced >= putReplacements {
+	if replaced >= putDiscardCap() {
 		return false
 	}
 	deadline, ok := ctx.Deadline()

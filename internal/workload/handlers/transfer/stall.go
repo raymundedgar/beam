@@ -222,6 +222,36 @@ func (t *transferLog) putStarted() {
 	}
 }
 
+func (t *transferLog) putSample(upload, part string, bytesPerSec float64, acked int64) {
+	if t == nil {
+		return
+	}
+	t.out("transfer put_sample workload=%s attempt=%s upload=%s part_no=%s acked=%d rate_1s=%.2f",
+		t.workload, t.attempt, upload, part, acked, bytesPerSec/(1024*1024))
+}
+
+func (t *transferLog) putDiscard(upload, part, reason string, bytesPerSec float64, acked int64) {
+	if t == nil {
+		return
+	}
+	t.out("transfer put_discard workload=%s attempt=%s upload=%s part_no=%s reason=%s acked=%d rate_1s=%.2f",
+		t.workload, t.attempt, upload, part, reason, acked, bytesPerSec/(1024*1024))
+}
+
+func (t *transferLog) putAttempt(remote, colo, bucket, upload, part, reason string, snap tcpSnap, acked int64) {
+	if t == nil {
+		return
+	}
+	t.out("transfer put_attempt workload=%s attempt=%s remote=%s colo=%s rtt_us=%d cwnd=%d retrans=%d delivery_rate=%d rwnd_limited_us=%d sndbuf_limited_us=%d acked=%d bucket=%s upload=%s part_no=%s reason=%s",
+		t.workload, t.attempt, remote, colo, snap.rttUs, snap.cwnd, snap.retrans, snap.deliveryRate,
+		snap.rwndLimited, snap.sndbufLimited, acked, bucket, upload, part, reason)
+}
+
+func (t *transferLog) putProbe(kept int, rateA, rateB int64) {
+	t.out("transfer put_probe workload=%s attempt=%s kept=%d rate0=%d rate1=%d",
+		t.workload, t.attempt, kept, rateA, rateB)
+}
+
 func (t *transferLog) hedgeRead(kept int, first, second int64) {
 	t.out("transfer hedge_read workload=%s attempt=%s kept=%d bytes0=%d bytes1=%d",
 		t.workload, t.attempt, kept, first, second)

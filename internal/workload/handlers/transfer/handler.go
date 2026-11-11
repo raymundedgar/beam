@@ -539,9 +539,13 @@ func (h *Handler) putStream(ctx context.Context, part contracts.TransferPart, op
 		return partResult{bytes: size}, err
 	}
 	defer h.releaseUpload()
+	if putParallelProbe && size >= hedgeMinBytes {
+		return h.putParallel(ctx, part, open, size, digest)
+	}
 	replaced := 0
+	pace := &putPace{}
 	return h.retryPresigned(ctx, func() (partResult, error) {
-		allow := replaceSlowUpload(ctx, replaced)
+		allow := !pace.stopped() && replaceSlowUpload(ctx, replaced)
 		// A second upload is opened only when the first is still below the
 		// acknowledgement floor halfway through the probe, and only while two
 		// discards remain. Fast uploads never open it. The last attempt stays
@@ -551,7 +555,7 @@ func (h *Handler) putStream(ctx context.Context, part contracts.TransferPart, op
 			replaced += used
 			return result, err
 		}
-		result, err := h.putPresignedOnce(ctx, part, open, size, digest, allow, nil)
+		result, err := h.putPresignedOnce(ctx, part, open, size, digest, allow, nil, pace)
 		if errors.Is(err, errReplaced) {
 			replaced++
 		}
@@ -573,7 +577,7 @@ func (h *Handler) putPresignedHedged(ctx context.Context, part contracts.Transfe
 	ch := make(chan outcome, 2)
 	var progress atomic.Int64
 	go func() {
-		result, err := h.putPresignedOnce(attemptCtx, part, open, size, digest, true, &progress)
+		result, err := h.putPresignedOnce(attemptCtx, part, open, size, digest, true, &progress, nil)
 		ch <- outcome{result, err}
 	}()
 	hedgeAt := putAckQuiet / 2
@@ -603,7 +607,7 @@ func (h *Handler) putPresignedHedged(ctx context.Context, part contracts.Transfe
 			}
 			pending++
 			go func() {
-				result, err := h.putPresignedOnce(attemptCtx, part, open, size, digest, true, nil)
+				result, err := h.putPresignedOnce(attemptCtx, part, open, size, digest, true, nil, nil)
 				ch <- outcome{result, err}
 			}()
 		case o := <-ch:
@@ -663,7 +667,7 @@ func (h *Handler) retryPresigned(ctx context.Context, attemptFn func() (partResu
 	}
 }
 
-func (h *Handler) putPresignedOnce(ctx context.Context, part contracts.TransferPart, open bodyOpen, size int64, digest string, allowReplace bool, progress *atomic.Int64) (partResult, error) {
+func (h *Handler) putPresignedOnce(ctx context.Context, part contracts.TransferPart, open bodyOpen, size int64, digest string, allowReplace bool, progress *atomic.Int64, pace *putPace) (partResult, error) {
 	destinationMethod := strings.ToUpper(strings.TrimSpace(part.Destination.Method))
 	if destinationMethod == "" {
 		destinationMethod = http.MethodPut
@@ -687,7 +691,7 @@ func (h *Handler) putPresignedOnce(ctx context.Context, part contracts.TransferP
 		if allowReplace {
 			stallCancel = cancel
 		}
-		go watchPutAck(attemptCtx, stallCancel, &counter.n, total, quiet, minRate, func() (int64, bool) {
+		sampleAck := func() (int64, bool) {
 			conn, _ := held.Load().(net.Conn)
 			if conn == nil {
 				return 0, false
@@ -711,9 +715,21 @@ func (h *Handler) putPresignedOnce(ctx context.Context, part contracts.TransferP
 				progress.Store(delta)
 			}
 			return n, true
-		}, func(written, acked int64) {
-			traceFrom(ctx).replaced(part.Index, "destination", "ack_stall", written, acked)
-		}, paused)
+		}
+		if putPolicy {
+			go watchPutRecent(attemptCtx, stallCancel, total, putWindow, minRate, sampleAck, paused, pace,
+				func(rate float64, n int64) {
+					traceFrom(ctx).putSample(uploadID, partNo, rate, n)
+				},
+				func(rate float64, n int64) {
+					traceFrom(ctx).replaced(part.Index, "destination", "ack_stall", counter.n.Load(), int64(rate))
+					traceFrom(ctx).putDiscard(uploadID, partNo, "slow_1s", rate, n)
+				})
+		} else {
+			go watchPutAck(attemptCtx, stallCancel, &counter.n, total, quiet, minRate, sampleAck, func(written, acked int64) {
+				traceFrom(ctx).replaced(part.Index, "destination", "ack_stall", written, acked)
+			}, paused)
+		}
 	}
 	destinationRequest, err := http.NewRequestWithContext(attemptCtx, destinationMethod, part.Destination.URL, counter)
 	if err != nil {
@@ -722,6 +738,7 @@ func (h *Handler) putPresignedOnce(ctx context.Context, part contracts.TransferP
 	destinationRequest = destinationRequest.WithContext(httptrace.WithClientTrace(attemptCtx, &httptrace.ClientTrace{
 		GotConn: func(info httptrace.GotConnInfo) {
 			if info.Conn != nil {
+				tuneUploadSocket(info.Conn)
 				held.Store(info.Conn)
 			}
 		},
@@ -749,6 +766,7 @@ func (h *Handler) putPresignedOnce(ctx context.Context, part contracts.TransferP
 	}
 	traceFrom(ctx).pacePut(part.Index, statusCode(destinationResponse), counter.n.Load(), time.Since(started), counter.blockedFor(), counter.longestGap(), respWait, counter.waitedInRead(), acked, ackSeen.Load(), ackAge, uploadID, partNo, part.Destination.Region)
 	conn, _ := held.Load().(net.Conn)
+	snap := readTCP(conn)
 	if err != nil {
 		// A failed attempt must not be the next idle socket. The pool is
 		// last-in, so it would be handed to the retry ahead of a fast socket
@@ -763,6 +781,14 @@ func (h *Handler) putPresignedOnce(ctx context.Context, part contracts.TransferP
 		return partResult{bytes: size}, fmt.Errorf("write destination: %w", err)
 	}
 	drop := dropSlowUpload(destinationResponse.StatusCode, acked, ackSeen.Load(), time.Since(started), size)
+	reason := "ok"
+	switch {
+	case destinationResponse.StatusCode >= 500:
+		reason = "http_5xx"
+	case drop:
+		reason = "slow"
+	}
+	traceFrom(ctx).putAttempt(remoteIP(conn), cfColo(destinationResponse.Header), bucketOf(part.Destination.URL), uploadID, partNo, reason, snap, acked)
 	releaseResponse(destinationResponse, conn, drop)
 	if destinationResponse.StatusCode < 200 || destinationResponse.StatusCode >= 300 {
 		return partResult{bytes: size}, &statusError{label: "destination", status: destinationResponse.StatusCode}
@@ -790,7 +816,7 @@ func dropSlowUpload(status int, acked int64, known bool, dur time.Duration, size
 // first so the transport cannot put it back in the idle pool.
 func releaseResponse(resp *http.Response, conn net.Conn, drop bool) {
 	if drop && conn != nil {
-		_ = conn.Close()
+		discardUploadSocket(conn)
 	}
 	if resp == nil || resp.Body == nil {
 		return
