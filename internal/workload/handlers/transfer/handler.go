@@ -73,13 +73,16 @@ type Handler struct {
 	slots chan struct{}
 	// uploads limits PUTs. Nil means no separate upload limit.
 	uploads chan struct{}
+	// batches lets one part of a task_offer_batch finish before the others read.
+	batches *batchPriority
 }
 
 func NewHandler(client *http.Client) *Handler {
 	if client == nil {
 		client = storagehttp.NewClient(30 * time.Minute)
 	}
-	return &Handler{client: client, wait: sleepContext, logf: log.Printf, slots: transferSlots(), uploads: uploadSlots()}
+	return &Handler{client: client, wait: sleepContext, logf: log.Printf, slots: transferSlots(), uploads: uploadSlots(),
+		batches: newBatchPriority()}
 }
 
 func transferSlots() chan struct{} {
@@ -213,6 +216,16 @@ func (h *Handler) Execute(ctx context.Context, spec domain.Spec) (domain.Result,
 	trace := &transferLog{workload: spec.WorkloadID, attempt: spec.AttemptID, started: time.Now(), printf: h.logf}
 	ctx = withTrace(ctx, trace)
 	trace.admitted(len(transfer.Parts))
+	leader := true
+	if !transfer.Fanout && deliverFirst && spec.BatchID != "" && h.batches != nil {
+		var release func()
+		leader, release = h.batches.begin(ctx, spec.BatchID, spec.AttemptID)
+		defer release()
+	}
+	ctx = withLeader(ctx, leader)
+	defer func() {
+		trace.reported(spec.BatchID, leader, ctx.Err() != nil)
+	}()
 	if transfer.Fanout {
 		return h.executeFanout(ctx, transfer)
 	}
@@ -361,6 +374,9 @@ func (h *Handler) readSource(ctx context.Context, part contracts.TransferPart) (
 }
 
 func (h *Handler) readSourcePublish(ctx context.Context, part contracts.TransferPart, publish func(*followBuffer)) ([]byte, error) {
+	if hedgeRead && isLeader(ctx) {
+		return h.readSourceRace(ctx, part, publish)
+	}
 	var lastErr error
 	httpAttempts := 0
 	replacements := 0

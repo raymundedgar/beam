@@ -139,8 +139,11 @@ type EvidencePolicy struct {
 }
 
 type Spec struct {
-	WorkloadID           string          `json:"workload_id"`
-	AttemptID            string          `json:"attempt_id"`
+	WorkloadID string `json:"workload_id"`
+	AttemptID  string `json:"attempt_id"`
+	// BatchID is the BeamCore task_offer_batch that offered this workload.
+	// Tasks that share it were offered together. Empty for callers that do not have a batch.
+	BatchID              string          `json:"batch_id,omitempty"`
 	Identity             Identity        `json:"identity"`
 	Kind                 Kind            `json:"kind"`
 	Class                Class           `json:"class"`

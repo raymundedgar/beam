@@ -404,6 +404,7 @@ func (control *roomControl) handleTaskOfferBatch(ctx context.Context, encoded []
 		if err != nil {
 			return err
 		}
+		spec.BatchID = batch.BatchID
 		specs = append(specs, spec)
 	}
 	failures := make([]error, len(specs))

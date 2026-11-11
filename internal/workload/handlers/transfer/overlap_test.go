@@ -90,6 +90,9 @@ func TestOverlapKeepsTheUploadWhileTheDownloadPauses(t *testing.T) {
 }
 
 func TestOverlapDoesNotUploadAReadThatWillBeReplaced(t *testing.T) {
+	previous := earlyPut
+	earlyPut = false
+	t.Cleanup(func() { earlyPut = previous })
 	buf := newFollowBuffer(50 << 20)
 	if _, err := buf.Write(bytes.Repeat([]byte{1}, 8<<20)); err != nil {
 		t.Fatal(err)
@@ -109,6 +112,22 @@ func TestOverlapDoesNotUploadAReadThatWillBeReplaced(t *testing.T) {
 	}
 	if !overlapReady(fast, time.Now().Add(-1500*time.Millisecond), 50<<20) {
 		t.Fatal("a read that can finish inside the budget did not start an upload")
+	}
+}
+
+func TestEarlyPutStartsOnceAMegabyteIsBuffered(t *testing.T) {
+	previous := earlyPut
+	earlyPut = true
+	t.Cleanup(func() { earlyPut = previous })
+	buf := newFollowBuffer(50 << 20)
+	if overlapReady(buf, time.Now().Add(-time.Second), 50<<20) {
+		t.Fatal("an empty buffer started an upload")
+	}
+	if _, err := buf.Write(bytes.Repeat([]byte{1}, 1<<20)); err != nil {
+		t.Fatal(err)
+	}
+	if !overlapReady(buf, time.Now(), 50<<20) {
+		t.Fatal("upload did not start after 1 MiB was buffered")
 	}
 }
 

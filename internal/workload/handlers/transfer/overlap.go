@@ -163,6 +163,14 @@ func overlapReady(buf *followBuffer, started time.Time, total int64) bool {
 	if n <= 0 {
 		return false
 	}
+	if earlyPut {
+		// A result can only be reported once the PUT finishes, so start it as
+		// soon as a megabyte is buffered, or half a second after the first byte.
+		if n >= earlyPutBytes {
+			return true
+		}
+		return n > 0 && time.Since(started) >= earlyPutAfter
+	}
 	elapsed := time.Since(started)
 	if mostlyReceived(n, total) {
 		return true
@@ -244,6 +252,7 @@ func (h *Handler) transferOverlapped(ctx context.Context, part contracts.Transfe
 		putCancel = cancel
 		putCh = ch
 		putBuf = buf
+		traceFrom(ctx).putStarted()
 		go func() {
 			res, err := h.putStream(pctx, part, func(c context.Context) (io.Reader, func() bool) {
 				reader := buf.reader(c)

@@ -178,6 +178,9 @@ type transferLog struct {
 	started  time.Time
 	once     sync.Once
 	printf   func(string, ...any)
+	mu       sync.Mutex
+	firstAt  time.Time
+	putAt    time.Time
 }
 
 func (t *transferLog) out(format string, args ...any) {
@@ -200,9 +203,57 @@ func (t *transferLog) moved(part int, side string) {
 		return
 	}
 	t.once.Do(func() {
+		t.mu.Lock()
+		t.firstAt = time.Now()
+		t.mu.Unlock()
 		t.out("transfer first_byte workload=%s attempt=%s part=%d side=%s after=%s",
 			t.workload, t.attempt, part, side, time.Since(t.started).Round(time.Millisecond))
 	})
+}
+
+func (t *transferLog) putStarted() {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.putAt.IsZero() {
+		t.putAt = time.Now()
+	}
+}
+
+func (t *transferLog) hedgeRead(kept int, first, second int64) {
+	t.out("transfer hedge_read workload=%s attempt=%s kept=%d bytes0=%d bytes1=%d",
+		t.workload, t.attempt, kept, first, second)
+}
+
+func (t *transferLog) reported(batch string, leader, cut bool) {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	first, putAt := t.firstAt, t.putAt
+	t.mu.Unlock()
+	ttfb, putStart := time.Duration(-1), time.Duration(-1)
+	if !first.IsZero() {
+		ttfb = first.Sub(t.started)
+	}
+	if !putAt.IsZero() {
+		putStart = putAt.Sub(t.started)
+	}
+	if batch == "" {
+		batch = "-"
+	}
+	t.out("transfer report workload=%s attempt=%s batch=%s first_deliverer=%t ttfb=%s put_start=%s result=%s cut=%t",
+		t.workload, t.attempt, batch, leader,
+		reportDur(ttfb), reportDur(putStart), time.Since(t.started).Round(time.Millisecond), cut)
+}
+
+func reportDur(d time.Duration) string {
+	if d < 0 {
+		return "-"
+	}
+	return d.Round(time.Millisecond).String()
 }
 
 func (t *transferLog) stalled(part int, side string, offset int64) {
