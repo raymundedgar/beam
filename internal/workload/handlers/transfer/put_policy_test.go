@@ -14,23 +14,35 @@ import (
 func TestTwoSlowSecondsDiscardAndOneFastSecondDoesNot(t *testing.T) {
 	var windows ackWindows
 	start := time.Now()
-	if sampled, _, discard := windows.push(start, 0, time.Second, float64(3<<20)); sampled || discard {
+	if sampled, _, lows := windows.push(start, 0, time.Second, float64(3<<20)); sampled || lows != 0 {
 		t.Fatal("the first sample has no window yet")
 	}
 	// 1 MiB in the first second is under 3 MiB/s.
-	sampled, _, discard := windows.push(start.Add(time.Second), 1<<20, time.Second, float64(3<<20))
-	if !sampled || discard {
-		t.Fatalf("sampled=%v discard=%v, one slow second is kept", sampled, discard)
+	sampled, _, lows := windows.push(start.Add(time.Second), 1<<20, time.Second, float64(3<<20))
+	if !sampled || lows != 1 {
+		t.Fatalf("sampled=%v lows=%d, one slow second is kept", sampled, lows)
 	}
 	// 4 MiB in the next second clears the streak.
-	if _, _, discard = windows.push(start.Add(2*time.Second), 5<<20, time.Second, float64(3<<20)); discard {
-		t.Fatal("a fast second was discarded")
+	if _, _, lows = windows.push(start.Add(2*time.Second), 5<<20, time.Second, float64(3<<20)); lows != 0 {
+		t.Fatal("a fast second left the slow streak set")
 	}
 	// Two slow seconds in a row discard. 5 MiB + 1 MiB + 1 MiB.
 	windows.push(start.Add(3*time.Second), 6<<20, time.Second, float64(3<<20))
-	_, _, discard = windows.push(start.Add(4*time.Second), 7<<20, time.Second, float64(3<<20))
-	if !discard {
+	_, _, lows = windows.push(start.Add(4*time.Second), 7<<20, time.Second, float64(3<<20))
+	if lows < 2 {
 		t.Fatal("two consecutive slow seconds were kept")
+	}
+}
+
+func TestProvenUploadNeedsFourSlowSeconds(t *testing.T) {
+	if putSlowStreak(1<<20, 50<<20) != 2 {
+		t.Fatal("a fresh upload discarded on one slow second")
+	}
+	if putSlowStreak(putAckKeep, 50<<20) != putAckTailFactor {
+		t.Fatal("16 MiB acknowledged did not lengthen the slow streak")
+	}
+	if putSlowStreak(25<<20, 50<<20) != putAckTailFactor {
+		t.Fatal("half the object did not lengthen the slow streak")
 	}
 }
 

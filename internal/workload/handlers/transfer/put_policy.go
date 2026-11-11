@@ -71,17 +71,17 @@ type ackWindows struct {
 	latest float64
 }
 
-func (w *ackWindows) push(now time.Time, acked int64, window time.Duration, minRate float64) (sampled bool, rate float64, discard bool) {
+func (w *ackWindows) push(now time.Time, acked int64, window time.Duration, minRate float64) (sampled bool, rate float64, lows int) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 	if !w.have {
 		w.have = true
 		w.at, w.base = now, acked
-		return false, 0, false
+		return false, 0, 0
 	}
 	elapsed := now.Sub(w.at)
 	if elapsed < window || elapsed <= 0 {
-		return false, 0, false
+		return false, 0, 0
 	}
 	rate = float64(acked-w.base) / elapsed.Seconds()
 	if rate < 0 {
@@ -94,7 +94,17 @@ func (w *ackWindows) push(now time.Time, acked int64, window time.Duration, minR
 	} else {
 		w.lows = 0
 	}
-	return true, rate, w.lows >= 2
+	return true, rate, w.lows
+}
+
+// putSlowStreak is how many consecutive slow seconds discard an upload.
+// A socket that has already acknowledged 16 MiB, or half the object, can sit
+// through a short pause. Four slow seconds means the rate really stayed low.
+func putSlowStreak(progress, total int64) int {
+	if total > 0 && (progress >= putAckKeep || pastHalfway(progress, total)) {
+		return putAckTailFactor
+	}
+	return 2
 }
 
 func (w *ackWindows) reset(now time.Time, acked int64) {
@@ -103,9 +113,10 @@ func (w *ackWindows) reset(now time.Time, acked int64) {
 	w.mu.Unlock()
 }
 
-// watchPutRecent cancels only after two consecutive ~1s windows stay under
-// minRate. cancel may be nil; samples are still reported. A replacement that
-// is not faster than the socket it replaced is kept.
+// watchPutRecent cancels only after consecutive ~1s windows stay under minRate.
+// A socket that has already moved 16 MiB needs four slow seconds. Two slow
+// seconds discard a socket that has not. A replacement that is not faster than
+// the socket it replaced is kept.
 func watchPutRecent(ctx context.Context, cancel context.CancelCauseFunc, total int64, window time.Duration, minRate int64, acked func() (int64, bool), paused func() bool, pace *putPace, onSample func(rate float64, acked int64), onStall func(rate float64, acked int64)) {
 	if window <= 0 || acked == nil {
 		return
@@ -138,18 +149,14 @@ func watchPutRecent(ctx context.Context, cancel context.CancelCauseFunc, total i
 				continue
 			}
 			progress := n - attemptAcked
-			if total > 0 && (progress >= putAckKeep || pastHalfway(progress, total)) {
-				windows.reset(now, n)
-				continue
-			}
-			sampled, rate, discard := windows.push(now, n, window, float64(minRate))
+			sampled, rate, lows := windows.push(now, n, window, float64(minRate))
 			if !sampled {
 				continue
 			}
 			if onSample != nil {
 				onSample(rate, n)
 			}
-			if !discard || cancel == nil {
+			if lows < putSlowStreak(progress, total) || cancel == nil {
 				continue
 			}
 			if pace.notFaster(int64(rate)) {
