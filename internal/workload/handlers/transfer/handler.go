@@ -73,16 +73,13 @@ type Handler struct {
 	slots chan struct{}
 	// uploads limits PUTs. Nil means no separate upload limit.
 	uploads chan struct{}
-	// batches lets one part of a task_offer_batch finish before the others read.
-	batches *batchPriority
 }
 
 func NewHandler(client *http.Client) *Handler {
 	if client == nil {
 		client = storagehttp.NewClient(30 * time.Minute)
 	}
-	return &Handler{client: client, wait: sleepContext, logf: log.Printf, slots: transferSlots(), uploads: uploadSlots(),
-		batches: newBatchPriority()}
+	return &Handler{client: client, wait: sleepContext, logf: log.Printf, slots: transferSlots(), uploads: uploadSlots()}
 }
 
 func transferSlots() chan struct{} {
@@ -217,11 +214,6 @@ func (h *Handler) Execute(ctx context.Context, spec domain.Spec) (domain.Result,
 	ctx = withTrace(ctx, trace)
 	trace.admitted(len(transfer.Parts))
 	leader := true
-	if !transfer.Fanout && deliverFirst && spec.BatchID != "" && h.batches != nil {
-		var release func()
-		leader, release = h.batches.begin(ctx, spec.BatchID, spec.AttemptID)
-		defer release()
-	}
 	ctx = withLeader(ctx, leader)
 	defer func() {
 		trace.reported(spec.BatchID, leader, ctx.Err() != nil)

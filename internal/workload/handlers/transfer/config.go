@@ -14,22 +14,13 @@ var (
 	earlyPut      = true
 	earlyPutBytes = int64(1 << 20)
 	earlyPutAfter = 500 * time.Millisecond
-	// deliverFirst lets one part of a batch read and upload while the others wait.
-	deliverFirst = true
-	deliverWait  = 5 * time.Second
-	// hedgeRead races two identical signed GETs for the batch's first part.
+	// hedgeRead races two identical signed GETs. Off unless BEAM_WORKER_READ_HEDGE=1.
 	hedgeRead      = false
 	hedgeReadAfter = 1500 * time.Millisecond
 )
 
 func init() {
 	earlyPut = envBool("BEAM_WORKER_EARLY_PUT", true)
-	deliverFirst = envBool("BEAM_WORKER_FIRST_DELIVERER", true)
-	if raw := os.Getenv("BEAM_WORKER_FIRST_DELIVERER_WAIT"); raw != "" {
-		if parsed, err := time.ParseDuration(raw); err == nil && parsed > 0 {
-			deliverWait = parsed
-		}
-	}
 	hedgeRead = envBool("BEAM_WORKER_READ_HEDGE", false)
 }
 
