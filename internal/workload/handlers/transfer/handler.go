@@ -740,7 +740,12 @@ func (h *Handler) putPresignedOnce(ctx context.Context, part contracts.TransferP
 		ackAge = time.Since(time.Unix(0, ackMoved.Load()))
 	}
 	traceFrom(ctx).pacePut(part.Index, statusCode(destinationResponse), counter.n.Load(), time.Since(started), counter.blockedFor(), counter.longestGap(), respWait, counter.waitedInRead(), acked, ackSeen.Load(), ackAge, uploadID, partNo, part.Destination.Region)
+	conn, _ := held.Load().(net.Conn)
 	if err != nil {
+		// A failed attempt must not be the next idle socket. The pool is
+		// last-in, so it would be handed to the retry ahead of a fast socket
+		// another task just released.
+		releaseResponse(destinationResponse, conn, true)
 		if ctx.Err() != nil {
 			return partResult{bytes: size}, ctx.Err()
 		}
@@ -749,8 +754,8 @@ func (h *Handler) putPresignedOnce(ctx context.Context, part contracts.TransferP
 		}
 		return partResult{bytes: size}, fmt.Errorf("write destination: %w", err)
 	}
-	defer destinationResponse.Body.Close()
-	_, _ = io.Copy(io.Discard, io.LimitReader(destinationResponse.Body, defaultResponseBodyLimit))
+	drop := dropSlowUpload(destinationResponse.StatusCode, acked, ackSeen.Load(), time.Since(started), size)
+	releaseResponse(destinationResponse, conn, drop)
 	if destinationResponse.StatusCode < 200 || destinationResponse.StatusCode >= 300 {
 		return partResult{bytes: size}, &statusError{label: "destination", status: destinationResponse.StatusCode}
 	}
@@ -758,6 +763,32 @@ func (h *Handler) putPresignedOnce(ctx context.Context, part contracts.TransferP
 		bytes: size, sha256: digest,
 		etag: strings.Trim(destinationResponse.Header.Get("ETag"), `"`),
 	}, nil
+}
+
+// dropSlowUpload reports that this upload socket should not be reused. A 5xx
+// or an acknowledgement rate below the keep line leaves the next request on
+// the fast idle socket a sibling just released, instead of this one.
+func dropSlowUpload(status int, acked int64, known bool, dur time.Duration, size int64) bool {
+	if status >= 500 {
+		return true
+	}
+	if !known || acked < 0 || dur <= 0 || size < hedgeMinBytes {
+		return false
+	}
+	return float64(acked)/dur.Seconds() < float64(putAckMinRate)
+}
+
+// releaseResponse reads and closes the body. drop closes the TCP connection
+// first so the transport cannot put it back in the idle pool.
+func releaseResponse(resp *http.Response, conn net.Conn, drop bool) {
+	if drop && conn != nil {
+		_ = conn.Close()
+	}
+	if resp == nil || resp.Body == nil {
+		return
+	}
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, defaultResponseBodyLimit))
+	_ = resp.Body.Close()
 }
 
 func (h *Handler) backoff(ctx context.Context, attempt int) error {
