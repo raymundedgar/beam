@@ -4,11 +4,13 @@ import (
 	"context"
 	"net"
 	"net/url"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unicode"
 
 	"github.com/Beam-Network/beam/internal/workload/contracts"
 	"golang.org/x/sys/unix"
@@ -310,6 +312,81 @@ func remoteIP(conn net.Conn) string {
 		return conn.RemoteAddr().String()
 	}
 	return host
+}
+
+// putResponseEvidence is the response fields worth sending to Cloudflare for
+// an upload that ran longer than slowPutAfter. Request secrets and anything
+// that looks like a presigned query are left out.
+func putResponseEvidence(header map[string][]string) (ray, fields string) {
+	if len(header) == 0 {
+		return "-", "headers=-"
+	}
+	keys := make([]string, 0, len(header))
+	for key := range header {
+		if skipResponseHeader(key) {
+			continue
+		}
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	var b strings.Builder
+	for _, key := range keys {
+		value := sanitizeLogValue(headerValue(header, key))
+		if value == "" || strings.Contains(strings.ToLower(value), "x-amz-signature") {
+			continue
+		}
+		if strings.EqualFold(key, "Cf-Ray") {
+			ray = value
+		}
+		if b.Len() > 0 {
+			b.WriteByte(' ')
+		}
+		b.WriteString(logHeaderKey(key))
+		b.WriteByte('=')
+		b.WriteString(value)
+	}
+	if ray == "" {
+		ray = "-"
+	}
+	if b.Len() == 0 {
+		return ray, "headers=-"
+	}
+	return ray, b.String()
+}
+
+func headerValue(header map[string][]string, name string) string {
+	for key, values := range header {
+		if strings.EqualFold(key, name) && len(values) > 0 {
+			return values[0]
+		}
+	}
+	return ""
+}
+
+func skipResponseHeader(key string) bool {
+	switch strings.ToLower(key) {
+	case "authorization", "proxy-authorization", "cookie", "set-cookie", "x-amz-security-token":
+		return true
+	default:
+		return false
+	}
+}
+
+func logHeaderKey(key string) string {
+	return strings.ToLower(strings.ReplaceAll(key, "-", "_"))
+}
+
+func sanitizeLogValue(value string) string {
+	value = strings.TrimSpace(value)
+	if len(value) > 180 {
+		value = value[:180]
+	}
+	return strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) || r == ' ' {
+			return '_'
+		}
+		return r
+	}, value)
 }
 
 func cfColo(header map[string][]string) string {

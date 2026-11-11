@@ -38,6 +38,9 @@ var (
 	// An upload that has already acknowledged putAckKeep is kept.
 	putAckQuiet   = 2 * time.Second
 	putAckMinRate = int64(3 << 20)
+	// slowPutAfter is how long an upload runs before its response headers are
+	// logged. The ray and request id are what Cloudflare can trace.
+	slowPutAfter = 10 * time.Second
 )
 
 // errReplaced closes a download that cannot finish inside sourceBudget.

@@ -343,6 +343,15 @@ func (t *transferLog) readSkip(n int64) {
 	t.out("transfer read_skip workload=%s attempt=%s bytes=%d build=%s", t.workload, t.attempt, n, buildID)
 }
 
+func (t *transferLog) putSlow(bucket, upload, part string, dur time.Duration, status int, header map[string][]string) {
+	if t == nil || dur < slowPutAfter {
+		return
+	}
+	ray, fields := putResponseEvidence(header)
+	t.out("transfer put_slow workload=%s attempt=%s dur=%s status=%d bucket=%s upload=%s part_no=%s cf_ray=%s %s",
+		t.workload, t.attempt, dur.Round(time.Millisecond), status, bucket, upload, part, ray, fields)
+}
+
 func (t *transferLog) putAttempt(remote, colo, bucket, upload, part, reason string, snap tcpSnap, acked int64, starved time.Duration) {
 	if t == nil {
 		return

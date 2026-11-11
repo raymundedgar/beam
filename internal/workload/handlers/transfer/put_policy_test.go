@@ -7,9 +7,36 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 )
+
+func TestSlowUploadEvidenceKeepsTheRay(t *testing.T) {
+	header := http.Header{}
+	header.Set("Cf-Ray", "9abc123def456-DFW")
+	header.Set("X-Amz-Request-Id", "req-1")
+	header.Set("Date", "Wed, 11 Nov 2026 13:44:00 GMT")
+	header.Set("Authorization", "secret-token")
+	header.Set("Set-Cookie", "sid=secret")
+	ray, fields := putResponseEvidence(header)
+	if ray != "9abc123def456-DFW" {
+		t.Fatalf("ray = %q", ray)
+	}
+	if !strings.Contains(fields, "cf_ray=9abc123def456-DFW") || !strings.Contains(fields, "x_amz_request_id=req-1") {
+		t.Fatalf("fields = %q", fields)
+	}
+	if strings.Contains(fields, "secret") {
+		t.Fatalf("secret leaked: %q", fields)
+	}
+	if !strings.Contains(fields, "date=Wed,_11_Nov_2026_13:44:00_GMT") {
+		t.Fatalf("date was not one token: %q", fields)
+	}
+	ray, fields = putResponseEvidence(nil)
+	if ray != "-" || fields != "headers=-" {
+		t.Fatalf("empty = %s %s", ray, fields)
+	}
+}
 
 func TestWarmSkipsLoopback(t *testing.T) {
 	if warmHost("127.0.0.1:9") || warmHost("::1") || warmHost("-") {

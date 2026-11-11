@@ -938,6 +938,11 @@ func (h *Handler) putPresignedOnce(ctx context.Context, part contracts.TransferP
 		ackAge = time.Since(time.Unix(0, ackMoved.Load()))
 	}
 	traceFrom(ctx).pacePut(part.Index, statusCode(destinationResponse), counter.n.Load(), time.Since(started), counter.blockedFor(), counter.longestGap(), respWait, counter.waitedInRead(), acked, ackSeen.Load(), ackAge, uploadID, partNo, part.Destination.Region)
+	var responseHeader http.Header
+	if destinationResponse != nil {
+		responseHeader = destinationResponse.Header
+	}
+	traceFrom(ctx).putSlow(bucketOf(part.Destination.URL), uploadID, partNo, time.Since(started), statusCode(destinationResponse), responseHeader)
 	conn, _ := held.Load().(net.Conn)
 	snap := readTCP(conn)
 	if err != nil {
