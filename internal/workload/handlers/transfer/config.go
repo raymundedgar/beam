@@ -23,10 +23,16 @@ var (
 	putPolicy      = true
 	putMaxDiscards = 2
 	putWindow      = time.Second
-	putSndBuf      = 1 << 20
-	putLinger      = true
-	// putParallelProbe keeps the current upload up while a second one is measured.
-	// Off unless BEAM_WORKER_PUT_PARALLEL_PROBE=1.
+	// putSndBuf 0 leaves TCP send-buffer autotuning on. A positive value is passed
+	// to SO_SNDBUF, which locks the buffer: Linux returns twice the requested
+	// size and will not grow it with RTT. On this host that turns 1 MiB into
+	// 2 MiB, below the buffer autotuning already selects. Set
+	// BEAM_WORKER_PUT_SNDBUF to compare a locked buffer.
+	putSndBuf = 0
+	putLinger = true
+	// putParallelProbe measures a second upload only after the first second was
+	// slow, and only when BEAM_WORKER_PUT_PARALLEL_PROBE=1. It stays off until
+	// a same-part concurrent PUT is confirmed on R2.
 	putParallelProbe = false
 )
 

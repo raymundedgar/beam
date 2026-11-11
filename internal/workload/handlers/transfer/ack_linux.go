@@ -34,10 +34,12 @@ func readTCP(conn net.Conn) tcpSnap {
 		if err != nil || info == nil {
 			return
 		}
+		buf, _ := unix.GetsockoptInt(int(fd), unix.SOL_SOCKET, unix.SO_SNDBUF)
 		snap = tcpSnap{
 			acked: int64(info.Bytes_acked), rttUs: info.Rtt, cwnd: info.Snd_cwnd,
 			retrans: info.Total_retrans, deliveryRate: info.Delivery_rate,
-			rwndLimited: info.Rwnd_limited, sndbufLimited: info.Sndbuf_limited, ok: true,
+			rwndLimited: info.Rwnd_limited, sndbufLimited: info.Sndbuf_limited,
+			sndbuf: buf, ok: true,
 		}
 	})
 	if err != nil {

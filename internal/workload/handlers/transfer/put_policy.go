@@ -23,6 +23,7 @@ type tcpSnap struct {
 	deliveryRate  uint64
 	rwndLimited   uint64
 	sndbufLimited uint64
+	sndbuf        int
 	ok            bool
 }
 
@@ -229,9 +230,10 @@ func cfColo(header map[string][]string) string {
 	return "-"
 }
 
-// putParallel leaves the current upload running and starts a second one on the
-// same bytes. The faster acknowledgement rate is kept. The other socket is
-// reset. This is off unless BEAM_WORKER_PUT_PARALLEL_PROBE=1.
+// putParallel leaves the first upload alone unless its first second of
+// acknowledgements is under the floor. Only then does it open a second socket
+// on the same bytes. The faster of the two is kept. This is off unless
+// BEAM_WORKER_PUT_PARALLEL_PROBE=1.
 func (h *Handler) putParallel(ctx context.Context, part contracts.TransferPart, open bodyOpen, size int64, digest string) (partResult, error) {
 	type outcome struct {
 		result partResult
@@ -245,7 +247,7 @@ func (h *Handler) putParallel(ctx context.Context, part contracts.TransferPart, 
 		res, err := h.putPresignedOnce(ctxA, part, open, size, digest, false, &progA, nil)
 		chA <- outcome{res, err}
 	}()
-	wait := time.NewTimer(2 * putWindow)
+	wait := time.NewTimer(putWindow)
 	select {
 	case <-ctx.Done():
 		cancelA(context.Canceled)
@@ -256,6 +258,12 @@ func (h *Handler) putParallel(ctx context.Context, part contracts.TransferPart, 
 		return out.result, out.err
 	case <-wait.C:
 	}
+	floor := putAckMinRate * int64(putWindow) / int64(time.Second)
+	if progA.Load() >= floor {
+		out := <-chA
+		return out.result, out.err
+	}
+	baseA := progA.Load()
 	ctxB, cancelB := context.WithCancelCause(ctx)
 	defer cancelB(context.Canceled)
 	var progB atomic.Int64
@@ -269,23 +277,28 @@ func (h *Handler) putParallel(ctx context.Context, part contracts.TransferPart, 
 	case <-ctx.Done():
 		cancelA(context.Canceled)
 		cancelB(context.Canceled)
+		<-chA
+		<-chB
 		return partResult{bytes: size}, ctx.Err()
 	case out := <-chA:
 		cancelB(errReplaced)
+		traceFrom(ctx).putProbe(0, progA.Load()-baseA, progB.Load())
 		return out.result, out.err
 	case out := <-chB:
 		cancelA(errReplaced)
+		traceFrom(ctx).putProbe(1, progA.Load()-baseA, progB.Load())
 		return out.result, out.err
 	case <-wait.C:
 	}
-	rateA, rateB := progA.Load(), progB.Load()
-	if rateB > rateA {
-		traceFrom(ctx).putProbe(1, rateA, rateB)
+	deltaA := progA.Load() - baseA
+	deltaB := progB.Load()
+	if deltaB > deltaA {
+		traceFrom(ctx).putProbe(1, deltaA, deltaB)
 		cancelA(errReplaced)
 		out := <-chB
 		return out.result, out.err
 	}
-	traceFrom(ctx).putProbe(0, rateA, rateB)
+	traceFrom(ctx).putProbe(0, deltaA, deltaB)
 	cancelB(errReplaced)
 	out := <-chA
 	return out.result, out.err

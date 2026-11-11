@@ -242,9 +242,9 @@ func (t *transferLog) putAttempt(remote, colo, bucket, upload, part, reason stri
 	if t == nil {
 		return
 	}
-	t.out("transfer put_attempt workload=%s attempt=%s remote=%s colo=%s rtt_us=%d cwnd=%d retrans=%d delivery_rate=%d rwnd_limited_us=%d sndbuf_limited_us=%d acked=%d bucket=%s upload=%s part_no=%s reason=%s",
+	t.out("transfer put_attempt workload=%s attempt=%s remote=%s colo=%s rtt_us=%d cwnd=%d retrans=%d delivery_rate=%d rwnd_limited_us=%d sndbuf_limited_us=%d sndbuf=%d acked=%d bucket=%s upload=%s part_no=%s reason=%s",
 		t.workload, t.attempt, remote, colo, snap.rttUs, snap.cwnd, snap.retrans, snap.deliveryRate,
-		snap.rwndLimited, snap.sndbufLimited, acked, bucket, upload, part, reason)
+		snap.rwndLimited, snap.sndbufLimited, snap.sndbuf, acked, bucket, upload, part, reason)
 }
 
 func (t *transferLog) putProbe(kept int, rateA, rateB int64) {
