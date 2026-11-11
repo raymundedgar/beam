@@ -194,6 +194,13 @@ func watchPutRecent(ctx context.Context, cancel context.CancelCauseFunc, total i
 			if onSample != nil {
 				onSample(rate, n)
 			}
+			if rate == 0 && snapFn != nil && !putInTail(progress, total) {
+				if snap := snapFn(); snap.ok && snap.unacked == 0 {
+					windows.reset(now, n)
+					zeros = 0
+					continue
+				}
+			}
 			if rate == 0 {
 				zeros++
 			} else {

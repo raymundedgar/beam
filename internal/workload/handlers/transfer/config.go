@@ -68,6 +68,13 @@ func init() {
 			putSndBuf = parsed
 		}
 	}
+	if raw := os.Getenv("BEAM_WORKER_EARLY_PUT_MIN_BYTES"); raw != "" {
+		if raw == "0" || raw == "off" {
+			earlyPut = false
+		} else if parsed, err := strconv.ParseInt(raw, 10, 64); err == nil && parsed > 0 {
+			earlyPutBytes = parsed
+		}
+	}
 }
 
 func envBool(key string, fallback bool) bool {

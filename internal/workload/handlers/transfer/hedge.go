@@ -44,6 +44,10 @@ var (
 // The signed GET is repeated. It is not a task result.
 var errReplaced = errors.New("slow source connection closed")
 
+// errSourceReset aborts the upload because the download was not a valid
+// continuation. It is not an upload discard and does not use the discard cap.
+var errSourceReset = errors.New("source reset")
+
 // tooSlow reports that moved bytes cannot reach total inside budget at the
 // rate observed over elapsed. A finished body is never slow.
 func tooSlow(moved, total int64, elapsed, budget time.Duration) bool {

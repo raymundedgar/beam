@@ -3,6 +3,7 @@ package transfer
 import (
 	"bytes"
 	"context"
+	"crypto/md5"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -374,6 +375,7 @@ func (h *Handler) readSourcePublish(ctx context.Context, part contracts.Transfer
 	httpAttempts := 0
 	replacements := 0
 	var pace readPace
+	var stamp sourceStamp
 	var buf *followBuffer
 	if publish != nil {
 		buf = newFollowBuffer(part.Length)
@@ -391,7 +393,7 @@ func (h *Handler) readSourcePublish(ctx context.Context, part contracts.Transfer
 		// worker would report as its own failure.
 		// A slow connection is closed and the signed GET is repeated. Bytes
 		// already buffered stay, and the upload keeps reading them.
-		body, err := h.readSourceOnce(ctx, part, replacements < maxSourceReplacements, replacements < readRestartCap && !pace.done(), buf, &pace)
+		body, err := h.readSourceOnce(ctx, part, replacements < maxSourceReplacements, replacements < readRestartCap && !pace.done(), buf, &pace, &stamp)
 		if err == nil {
 			if buf != nil {
 				buf.finish()
@@ -407,6 +409,28 @@ func (h *Handler) readSourcePublish(ctx context.Context, part contracts.Transfer
 		lastErr = err
 		if errors.Is(err, errReplaced) {
 			replacements++
+			continue
+		}
+		if errors.Is(err, errSourceReset) {
+			traceFrom(ctx).sourceReset(resetReason(err))
+			if buf != nil {
+				buf.fail(err)
+			}
+			buf = newFollowBuffer(part.Length)
+			stamp = sourceStamp{}
+			if publish != nil {
+				publish(buf)
+			}
+			httpAttempts++
+			if httpAttempts >= presignedAttempts {
+				return nil, err
+			}
+			if waitErr := h.backoff(ctx, httpAttempts); waitErr != nil {
+				if ctx.Err() != nil {
+					return nil, ctx.Err()
+				}
+				return nil, err
+			}
 			continue
 		}
 		if errors.Is(err, errStalled) {
@@ -426,8 +450,16 @@ func (h *Handler) readSourcePublish(ctx context.Context, part contracts.Transfer
 			}
 			return nil, err
 		}
-		// A failed attempt is not a prefix worth keeping. A rate restart is.
-		if buf != nil {
+		// A failed attempt is not a prefix worth keeping. Clearing the slice
+		// in place would leave the upload's read offset past the new bytes, so
+		// an attached upload is aborted and a new buffer is published instead.
+		if publish != nil && buf != nil {
+			traceFrom(ctx).sourceReset("retry")
+			buf.fail(err)
+			buf = newFollowBuffer(part.Length)
+			stamp = sourceStamp{}
+			publish(buf)
+		} else if buf != nil {
 			buf.reset()
 		}
 		if waitErr := h.backoff(ctx, httpAttempts); waitErr != nil {
@@ -439,7 +471,7 @@ func (h *Handler) readSourcePublish(ctx context.Context, part contracts.Transfer
 	}
 }
 
-func (h *Handler) readSourceOnce(ctx context.Context, part contracts.TransferPart, allowReplace, allowMedian bool, buf *followBuffer, pace *readPace) ([]byte, error) {
+func (h *Handler) readSourceOnce(ctx context.Context, part contracts.TransferPart, allowReplace, allowMedian bool, buf *followBuffer, pace *readPace, stamp *sourceStamp) ([]byte, error) {
 	started := time.Now()
 	counter := &byteCounter{onFirst: func() { traceFrom(ctx).moved(part.Index, "source") }}
 	var expected atomic.Int64
@@ -462,7 +494,7 @@ func (h *Handler) readSourceOnce(ctx context.Context, part contracts.TransferPar
 		}
 		go watchReadMedian(attemptCtx, cancel, &counter.n, have, part.Length, hostOf(part.Source.URL), pace)
 	}
-	body, err := h.readBody(ctx, stallCtx, part, counter, started, buf)
+	body, err := h.readBody(ctx, stallCtx, part, counter, started, buf, stamp)
 	if ctx.Err() != nil {
 		return nil, ctx.Err()
 	}
@@ -472,10 +504,13 @@ func (h *Handler) readSourceOnce(ctx context.Context, part contracts.TransferPar
 	return body, err
 }
 
-func (h *Handler) readBody(parent, attempt context.Context, part contracts.TransferPart, counter *byteCounter, started time.Time, buf *followBuffer) ([]byte, error) {
+func (h *Handler) readBody(parent, attempt context.Context, part contracts.TransferPart, counter *byteCounter, started time.Time, buf *followBuffer, stamp *sourceStamp) ([]byte, error) {
 	response, err := h.openSourceFrom(attempt, part, 0, "")
 	if err != nil {
 		traceFrom(parent).pace(part.Index, "source", 0, counter.n.Load(), time.Since(started), counter.blockedFor(), counter.longestGap(), 0, counter.waitedInRead(), part.Source.Region)
+		if reset := resetFromStatus(err); reset != nil {
+			return nil, reset
+		}
 		if parent.Err() != nil {
 			return nil, parent.Err()
 		}
@@ -487,6 +522,9 @@ func (h *Handler) readBody(parent, attempt context.Context, part contracts.Trans
 	}
 	respWait := time.Since(started)
 	defer response.Body.Close()
+	if err := stamp.observe(response); err != nil {
+		return nil, err
+	}
 	counter.r = response.Body
 	var body []byte
 	var readErr error
@@ -514,14 +552,17 @@ func (h *Handler) readBody(parent, attempt context.Context, part contracts.Trans
 	if parent.Err() != nil {
 		return nil, parent.Err()
 	}
+	if cause := context.Cause(attempt); cause == errReplaced || cause == errSourceReset {
+		return body, cause
+	}
 	if stalled(parent, attempt) {
 		traceFrom(parent).stalled(part.Index, "source", int64(len(body)))
 		return nil, errStalled
 	}
-	if readErr == nil || readErr == io.EOF {
-		readErr = io.ErrUnexpectedEOF
+	if readErr == nil || errors.Is(readErr, io.EOF) || errors.Is(readErr, io.ErrUnexpectedEOF) {
+		return nil, &resetError{reason: "short_body"}
 	}
-	return nil, fmt.Errorf("fetch source: %w", readErr)
+	return nil, &resetError{reason: "read_error"}
 }
 
 // uploadRef returns a short hash of the multipart upload id and the part
@@ -589,6 +630,8 @@ func (h *Handler) putStream(ctx context.Context, part contracts.TransferPart, op
 	}
 	replaced := 0
 	pace := &putPace{}
+	var waiting atomic.Bool
+	open = wrapStarved(open, &waiting)
 	return h.retryPresigned(ctx, func() (partResult, error) {
 		allow := !pace.stopped() && replaceSlowUpload(ctx, replaced)
 		// A second upload is opened only when the first is still below the
@@ -596,7 +639,7 @@ func (h *Handler) putStream(ctx context.Context, part contracts.TransferPart, op
 		// discards remain. Fast uploads never open it. The last attempt stays
 		// single so a path that is slow on every socket still delivers.
 		if allow && size >= hedgeMinBytes && replaceSlowUpload(ctx, replaced+1) {
-			result, err, used := h.putPresignedHedged(ctx, part, open, size, digest)
+			result, err, used := h.putPresignedHedged(ctx, part, open, size, digest, waiting.Load)
 			replaced += used
 			return result, err
 		}
@@ -608,11 +651,27 @@ func (h *Handler) putStream(ctx context.Context, part contracts.TransferPart, op
 	})
 }
 
+func wrapStarved(open bodyOpen, waiting *atomic.Bool) bodyOpen {
+	return func(ctx context.Context) (io.Reader, func() bool) {
+		reader, paused := open(ctx)
+		if paused == nil {
+			return reader, nil
+		}
+		return reader, func() bool {
+			starved := paused()
+			if waiting != nil {
+				waiting.Store(starved)
+			}
+			return starved
+		}
+	}
+}
+
 // putPresignedHedged starts one upload and, if it has not acknowledged at the
 // minimum rate by half the probe, starts a second with the same bytes. Either
 // acceptance cancels the other. A discard from the slow socket does not cancel
 // the one that is still running. used counts connections that were discarded.
-func (h *Handler) putPresignedHedged(ctx context.Context, part contracts.TransferPart, open bodyOpen, size int64, digest string) (partResult, error, int) {
+func (h *Handler) putPresignedHedged(ctx context.Context, part contracts.TransferPart, open bodyOpen, size int64, digest string, starved func() bool) (partResult, error, int) {
 	attemptCtx, cancel := context.WithCancelCause(ctx)
 	defer cancel(context.Canceled)
 	type outcome struct {
@@ -642,6 +701,9 @@ func (h *Handler) putPresignedHedged(ctx context.Context, part contracts.Transfe
 			return last, ctx.Err(), replaced
 		case <-timer.C:
 			if spare {
+				continue
+			}
+			if starved != nil && starved() {
 				continue
 			}
 			spare = true
@@ -721,7 +783,8 @@ func (h *Handler) putPresignedOnce(ctx context.Context, part contracts.TransferP
 	attemptCtx, cancel := context.WithCancelCause(ctx)
 	defer cancel(context.Canceled)
 	reader, paused := open(attemptCtx)
-	counter := &byteCounter{r: reader, onFirst: func() { traceFrom(ctx).moved(part.Index, "destination") }}
+	sentMD5 := md5.New()
+	counter := &byteCounter{r: io.TeeReader(reader, sentMD5), onFirst: func() { traceFrom(ctx).moved(part.Index, "destination") }}
 	var held atomic.Value
 	var ackBytes atomic.Int64
 	var ackSeen atomic.Bool
@@ -750,6 +813,10 @@ func (h *Handler) putPresignedOnce(ctx context.Context, part contracts.TransferP
 				ackMoved.Store(time.Now().UnixNano())
 			} else if n != ackBytes.Load() {
 				ackMoved.Store(time.Now().UnixNano())
+				traceFrom(ctx).firstAck()
+			}
+			if ackSeen.Load() && n > ackBase.Load() {
+				traceFrom(ctx).firstAck()
 			}
 			ackBytes.Store(n)
 			if progress != nil {
@@ -828,8 +895,11 @@ func (h *Handler) putPresignedOnce(ctx context.Context, part contracts.TransferP
 		if ctx.Err() != nil {
 			return partResult{bytes: size}, ctx.Err()
 		}
-		if context.Cause(attemptCtx) == errReplaced {
+		switch context.Cause(attemptCtx) {
+		case errReplaced:
 			return partResult{bytes: counter.n.Load()}, errReplaced
+		case errSourceReset:
+			return partResult{bytes: counter.n.Load()}, errSourceReset
 		}
 		return partResult{bytes: size}, fmt.Errorf("write destination: %w", err)
 	}
@@ -846,9 +916,15 @@ func (h *Handler) putPresignedOnce(ctx context.Context, part contracts.TransferP
 	if destinationResponse.StatusCode < 200 || destinationResponse.StatusCode >= 300 {
 		return partResult{bytes: size}, &statusError{label: "destination", status: destinationResponse.StatusCode}
 	}
+	etag := strings.Trim(destinationResponse.Header.Get("ETag"), `"`)
+	sent := hex.EncodeToString(sentMD5.Sum(nil))
+	if etag != "" && !strings.Contains(etag, "-") && !strings.EqualFold(etag, sent) {
+		log.Printf("ERROR transfer etag_mismatch workload part upload=%s part_no=%s etag=%s md5=%s", uploadID, partNo, etag, sent)
+		traceFrom(ctx).etagMismatch(uploadID, partNo, etag, sent)
+	}
 	return partResult{
 		bytes: size, sha256: digest,
-		etag: strings.Trim(destinationResponse.Header.Get("ETag"), `"`),
+		etag: etag,
 	}, nil
 }
 
@@ -1100,6 +1176,78 @@ func transientTransferError(err error) bool {
 		return true
 	}
 	return errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, syscall.ECONNRESET)
+}
+
+type resetError struct{ reason string }
+
+func (e *resetError) Error() string {
+	if e == nil || e.reason == "" {
+		return "source reset"
+	}
+	return "source reset: " + e.reason
+}
+
+func (e *resetError) Is(target error) bool { return target == errSourceReset }
+
+func resetReason(err error) string {
+	var reset *resetError
+	if errors.As(err, &reset) && reset.reason != "" {
+		return reset.reason
+	}
+	return "reset"
+}
+
+func resetFromStatus(err error) error {
+	var status *statusError
+	if !errors.As(err, &status) {
+		return nil
+	}
+	if status.status < 500 {
+		return nil
+	}
+	return &resetError{reason: fmt.Sprintf("http_%d", status.status)}
+}
+
+type sourceStamp struct {
+	etag     string
+	modified string
+	total    int64
+	set      bool
+}
+
+func (s *sourceStamp) observe(resp *http.Response) error {
+	if s == nil || resp == nil {
+		return nil
+	}
+	etag := strings.Trim(resp.Header.Get("ETag"), `"`)
+	modified := resp.Header.Get("Last-Modified")
+	total, _ := contentRangeTotal(resp.Header.Get("Content-Range"))
+	if !s.set {
+		s.etag, s.modified, s.total, s.set = etag, modified, total, true
+		return nil
+	}
+	if s.etag != "" && etag != "" && s.etag != etag {
+		return &resetError{reason: "etag"}
+	}
+	if s.modified != "" && modified != "" && s.modified != modified {
+		return &resetError{reason: "last_modified"}
+	}
+	if s.total > 0 && total > 0 && s.total != total {
+		return &resetError{reason: "length"}
+	}
+	return nil
+}
+
+func contentRangeTotal(value string) (int64, bool) {
+	slash := strings.LastIndex(value, "/")
+	if slash < 0 || slash+1 >= len(value) || value[slash+1:] == "*" {
+		return 0, false
+	}
+	n, err := strconv.ParseInt(value[slash+1:], 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return n, true
 }
 
 func copyHeaders(destination http.Header, source map[string]string) {

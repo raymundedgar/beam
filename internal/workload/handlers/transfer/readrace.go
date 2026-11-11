@@ -39,7 +39,7 @@ func (h *Handler) readSourceRace(ctx context.Context, part contracts.TransferPar
 	for i := range legs {
 		go func(i int) {
 			defer close(legs[i].done)
-			body, err := h.readSourceOnce(legs[i].ctx, part, false, false, legs[i].buf, nil)
+			body, err := h.readSourceOnce(legs[i].ctx, part, false, false, legs[i].buf, nil, nil)
 			legs[i].body, legs[i].err = body, err
 			if err != nil {
 				legs[i].buf.fail(err)

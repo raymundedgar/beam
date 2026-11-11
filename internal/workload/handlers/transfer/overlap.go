@@ -181,6 +181,17 @@ func (r *followReader) Read(p []byte) (int, error) {
 	}
 }
 
+// starved reports that this upload has sent every byte the download has
+// produced. Its acknowledgement rate is the read, not the network.
+func (r *followReader) starved() bool {
+	if r == nil {
+		return false
+	}
+	r.b.mu.Lock()
+	defer r.b.mu.Unlock()
+	return r.b.err == nil && !r.b.done && r.off >= len(r.b.buf)
+}
+
 // overlapReady reports that this download is worth an upload slot. A read the
 // watcher is about to discard is not: the upload would only be cancelled, and
 // the slot is needed by a slice that can finish.
@@ -264,7 +275,7 @@ func (h *Handler) transferOverlapped(ctx context.Context, part contracts.Transfe
 		if putCancel == nil {
 			return
 		}
-		putCancel(errReplaced)
+		putCancel(errSourceReset)
 		<-putCh
 		putCancel = nil
 		putCh = nil
@@ -285,7 +296,7 @@ func (h *Handler) transferOverlapped(ctx context.Context, part contracts.Transfe
 		go func() {
 			res, err := h.putStream(pctx, part, func(c context.Context) (io.Reader, func() bool) {
 				reader := buf.reader(c)
-				return reader, reader.waiting.Load
+				return reader, reader.starved
 			}, part.Length, "")
 			ch <- putOutcome{res, err}
 		}()
@@ -375,7 +386,7 @@ func (h *Handler) transferOverlapped(ctx context.Context, part contracts.Transfe
 			if getDone {
 				return outcome.result, outcome.err
 			}
-			if errors.Is(outcome.err, context.Canceled) || errors.Is(outcome.err, errReplaced) {
+			if errors.Is(outcome.err, context.Canceled) || errors.Is(outcome.err, errReplaced) || errors.Is(outcome.err, errSourceReset) {
 				continue
 			}
 			// The download attempt was abandoned and another read is coming.

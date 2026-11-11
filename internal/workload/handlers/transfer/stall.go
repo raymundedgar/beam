@@ -181,6 +181,7 @@ type transferLog struct {
 	mu       sync.Mutex
 	firstAt  time.Time
 	putAt    time.Time
+	ackAt    time.Time
 }
 
 func (t *transferLog) out(format string, args ...any) {
@@ -209,6 +210,17 @@ func (t *transferLog) moved(part int, side string) {
 		t.out("transfer first_byte workload=%s attempt=%s part=%d side=%s after=%s",
 			t.workload, t.attempt, part, side, time.Since(t.started).Round(time.Millisecond))
 	})
+}
+
+func (t *transferLog) firstAck() {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	if t.ackAt.IsZero() {
+		t.ackAt = time.Now()
+	}
+	t.mu.Unlock()
 }
 
 func (t *transferLog) putStarted() {
@@ -270,6 +282,21 @@ func (t *transferLog) readMedianEmpty(host string) {
 		t.workload, t.attempt, host, buildID)
 }
 
+func (t *transferLog) sourceReset(reason string) {
+	if t == nil {
+		return
+	}
+	t.out("transfer reset workload=%s attempt=%s reason=%s build=%s", t.workload, t.attempt, reason, buildID)
+}
+
+func (t *transferLog) etagMismatch(upload, part, etag, md5sum string) {
+	if t == nil {
+		return
+	}
+	t.out("ERROR transfer etag_mismatch workload=%s attempt=%s upload=%s part_no=%s etag=%s md5=%s",
+		t.workload, t.attempt, upload, part, etag, md5sum)
+}
+
 func (t *transferLog) readSkip(n int64) {
 	if t == nil || n <= 0 {
 		return
@@ -301,21 +328,24 @@ func (t *transferLog) reported(batch string, leader, cut bool) {
 		return
 	}
 	t.mu.Lock()
-	first, putAt := t.firstAt, t.putAt
+	first, putAt, ackAt := t.firstAt, t.putAt, t.ackAt
 	t.mu.Unlock()
-	ttfb, putStart := time.Duration(-1), time.Duration(-1)
+	ttfb, putStart, ack := time.Duration(-1), time.Duration(-1), time.Duration(-1)
 	if !first.IsZero() {
 		ttfb = first.Sub(t.started)
 	}
 	if !putAt.IsZero() {
 		putStart = putAt.Sub(t.started)
 	}
+	if !ackAt.IsZero() {
+		ack = ackAt.Sub(t.started)
+	}
 	if batch == "" {
 		batch = "-"
 	}
-	t.out("transfer report workload=%s attempt=%s batch=%s first_deliverer=%t ttfb=%s put_start=%s result=%s cut=%t %s",
+	t.out("transfer report workload=%s attempt=%s batch=%s first_deliverer=%t ttfb=%s put_start=%s ack=%s result=%s cut=%t %s",
 		t.workload, t.attempt, batch, leader,
-		reportDur(ttfb), reportDur(putStart), time.Since(t.started).Round(time.Millisecond), cut, policyStamp())
+		reportDur(ttfb), reportDur(putStart), reportDur(ack), time.Since(t.started).Round(time.Millisecond), cut, policyStamp())
 }
 
 func reportDur(d time.Duration) string {
