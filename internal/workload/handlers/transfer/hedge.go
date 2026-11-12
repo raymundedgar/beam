@@ -58,6 +58,11 @@ var errReadRetry = errors.New("read retry")
 // errETagMismatch is a part ETag that is not the MD5 of the bytes sent.
 var errETagMismatch = errors.New("etag mismatch")
 
+// errIdleClosed is an early PUT the peer dropped while the reader was waiting
+// on the download. The part is sent again from the first buffered byte and the
+// attempt does not use a discard.
+var errIdleClosed = errors.New("idle upload closed")
+
 // tooSlow reports that moved bytes cannot reach total inside budget at the
 // rate observed over elapsed. A finished body is never slow.
 func tooSlow(moved, total int64, elapsed, budget time.Duration) bool {

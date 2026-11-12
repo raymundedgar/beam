@@ -12,6 +12,13 @@ import (
 	"time"
 )
 
+func TestPolicyStampUsesTheEmbeddedRevision(t *testing.T) {
+	t.Log(policyStamp())
+	if !strings.Contains(policyStamp(), "build=") || strings.Contains(policyStamp(), "build=unknown") && revisionFromBuildInfo() != "" {
+		t.Fatalf("stamp = %s info=%s", policyStamp(), revisionFromBuildInfo())
+	}
+}
+
 func TestSlowUploadEvidenceKeepsTheRay(t *testing.T) {
 	header := http.Header{}
 	header.Set("Cf-Ray", "9abc123def456-DFW")

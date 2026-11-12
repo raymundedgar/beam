@@ -175,6 +175,7 @@ func leaveTransfer() { activeTransfers.Add(-1) }
 type transferLog struct {
 	workload    string
 	attempt     string
+	batch       string
 	started     time.Time
 	once        sync.Once
 	printf      func(string, ...any)
@@ -341,6 +342,22 @@ func (t *transferLog) readSkip(n int64) {
 		return
 	}
 	t.out("transfer read_skip workload=%s attempt=%s bytes=%d build=%s", t.workload, t.attempt, n, buildID)
+}
+
+func (t *transferLog) uploadWait(waited time.Duration, holders string) {
+	if t == nil {
+		return
+	}
+	t.out("transfer upload_wait workload=%s attempt=%s batch=%s waited=%s holders=%s",
+		t.workload, t.attempt, t.batch, waited.Round(time.Millisecond), holders)
+}
+
+func (t *transferLog) idleClosed(upload, part string) {
+	if t == nil {
+		return
+	}
+	t.out("transfer put_idle_closed workload=%s attempt=%s upload=%s part_no=%s reason=idle_closed build=%s",
+		t.workload, t.attempt, upload, part, buildID)
 }
 
 func (t *transferLog) putSlow(bucket, upload, part string, dur time.Duration, status int, header map[string][]string) {

@@ -3,6 +3,7 @@ package transfer
 import (
 	"fmt"
 	"log"
+	"runtime/debug"
 	"strings"
 	"sync"
 )
@@ -16,13 +17,49 @@ var (
 )
 
 func init() {
-	buildID = buildRevision
+	buildID = strings.TrimSpace(buildRevision)
+	if buildID == "" || buildID == "unknown" {
+		if rev := revisionFromBuildInfo(); rev != "" {
+			buildID = rev
+		}
+	}
+	if buildID == "" {
+		buildID = "unknown"
+	}
 	switch strings.ToLower(buildDirty) {
 	case "1", "true", "dirty":
 		if !strings.HasSuffix(buildID, "-dirty") {
 			buildID += "-dirty"
 		}
 	}
+}
+
+// revisionFromBuildInfo reads the VCS settings Go embeds when the binary is
+// built inside a git checkout. The ldflag wins when it is set.
+func revisionFromBuildInfo() string {
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return ""
+	}
+	var rev, modified string
+	for _, setting := range info.Settings {
+		switch setting.Key {
+		case "vcs.revision":
+			rev = setting.Value
+		case "vcs.modified":
+			modified = setting.Value
+		}
+	}
+	if rev == "" {
+		return ""
+	}
+	if len(rev) > 7 {
+		rev = rev[:7]
+	}
+	if modified == "true" {
+		rev += "-dirty"
+	}
+	return rev
 }
 
 func policyStamp() string {

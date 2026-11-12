@@ -216,7 +216,20 @@ build() {
   log "building orchestrator"
   go build -trimpath -o "$ORCH_BIN" ./cmd/beam-orchestrator
   log "building worker"
-  go build -trimpath -o "$WORKER_BIN" ./cmd/beam-worker
+  local rev dirty ldflags
+  rev="$(git -C "$ROOT" rev-parse --short=7 HEAD 2>/dev/null || true)"
+  dirty=""
+  if [ -n "$rev" ] && { ! git -C "$ROOT" diff --quiet || ! git -C "$ROOT" diff --cached --quiet; }; then
+    dirty=dirty
+  fi
+  ldflags=""
+  if [ -n "$rev" ]; then
+    ldflags="-X github.com/Beam-Network/beam/internal/workload/handlers/transfer.buildRevision=${rev}"
+    if [ -n "$dirty" ]; then
+      ldflags="${ldflags} -X github.com/Beam-Network/beam/internal/workload/handlers/transfer.buildDirty=dirty"
+    fi
+  fi
+  go build -trimpath -ldflags "${ldflags}" -o "$WORKER_BIN" ./cmd/beam-worker
 }
 
 tmux_running() {

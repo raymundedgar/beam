@@ -195,6 +195,72 @@ func (r *followReader) starved() bool {
 	return r.b.err == nil && !r.b.done && r.off >= len(r.b.buf)
 }
 
+// pending reports unread bytes without waiting. The lock is not held on return.
+func (r *followReader) pending() (ahead int, done bool, err error) {
+	if r == nil || r.b == nil {
+		return 0, true, io.ErrClosedPipe
+	}
+	r.b.mu.Lock()
+	defer r.b.mu.Unlock()
+	ahead = len(r.b.buf) - r.off
+	if ahead < 0 {
+		ahead = 0
+	}
+	return ahead, r.b.done, r.b.err
+}
+
+// waitUntil blocks until minAhead unread bytes are buffered, the download
+// finishes or fails, the limit elapses, or ctx ends. The buffer lock is not
+// held while this waits, except inside cond.Wait, so a GET can still Write.
+// ready is false when the limit elapsed first.
+func (r *followReader) waitUntil(ctx context.Context, minAhead int, limit time.Duration) (bool, error) {
+	if r == nil || r.b == nil {
+		return false, io.ErrClosedPipe
+	}
+	if minAhead < 1 {
+		minAhead = 1
+	}
+	r.b.mu.Lock()
+	defer r.b.mu.Unlock()
+	var deadline time.Time
+	if limit > 0 {
+		deadline = time.Now().Add(limit)
+	}
+	stop := context.AfterFunc(ctx, func() { r.b.cond.Broadcast() })
+	defer stop()
+	var timer *time.Timer
+	if limit > 0 {
+		timer = time.AfterFunc(limit, func() { r.b.cond.Broadcast() })
+		defer timer.Stop()
+	}
+	for {
+		unread := len(r.b.buf) - r.off
+		if unread < 0 {
+			unread = 0
+		}
+		if r.b.err != nil && unread == 0 {
+			r.waiting.Store(false)
+			return false, r.b.err
+		}
+		if unread >= minAhead || r.b.done {
+			r.waiting.Store(false)
+			return true, nil
+		}
+		if err := ctx.Err(); err != nil {
+			r.waiting.Store(false)
+			return false, err
+		}
+		if limit > 0 && !time.Now().Before(deadline) {
+			r.waiting.Store(true)
+			return false, nil
+		}
+		r.waiting.Store(true)
+		started := time.Now()
+		r.b.cond.Wait()
+		r.waited.Add(int64(time.Since(started)))
+	}
+}
+
 func (r *followReader) starvedFor() time.Duration {
 	if r == nil {
 		return 0

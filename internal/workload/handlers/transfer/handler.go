@@ -72,8 +72,10 @@ type Handler struct {
 	logf func(string, ...any)
 	// slots limits transfers that are reading or writing. Nil means no limit.
 	slots chan struct{}
-	// uploads limits PUTs. Nil means no separate upload limit.
+	// uploads limits PUTs that are actually sending. Nil means no separate upload limit.
 	uploads chan struct{}
+	// gate releases that limit while a PUT is waiting on its download.
+	gate *uploadGate
 }
 
 func NewHandler(client *http.Client) *Handler {
@@ -81,7 +83,10 @@ func NewHandler(client *http.Client) *Handler {
 		client = storagehttp.NewClient(30 * time.Minute)
 	}
 	logPolicy()
-	return &Handler{client: client, wait: sleepContext, logf: log.Printf, slots: transferSlots(), uploads: uploadSlots()}
+	h := &Handler{client: client, wait: sleepContext, logf: log.Printf, slots: transferSlots(), uploads: uploadSlots()}
+	h.gate = newUploadGate(h.uploads, putOpenSlots())
+	h.gate.h = h
+	return h
 }
 
 func transferSlots() chan struct{} {
@@ -133,6 +138,27 @@ func uploadSlots() chan struct{} {
 	}
 	if n < 0 {
 		return nil
+	}
+	return make(chan struct{}, n)
+}
+
+// putOpenSlots caps PUT connections, including ones waiting on a download.
+// Idle connections no longer take a send token, so this keeps a wave from
+// opening one socket per task without a bound. PUT_OPEN_MAX overrides it.
+// Otherwise it follows the download concurrency, which is one PUT per task.
+func putOpenSlots() chan struct{} {
+	n := defaultTransferSlots
+	if raw := os.Getenv("BEAM_WORKER_PUT_OPEN_MAX"); raw != "" {
+		if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 {
+			n = parsed
+		}
+	} else if raw := os.Getenv("BEAM_WORKER_TRANSFER_CONCURRENCY"); raw != "" {
+		if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 {
+			n = parsed
+		}
+	}
+	if n < 1 {
+		n = defaultTransferSlots
 	}
 	return make(chan struct{}, n)
 }
@@ -212,7 +238,7 @@ func (h *Handler) Execute(ctx context.Context, spec domain.Spec) (domain.Result,
 	if err := json.Unmarshal(spec.Payload, &transfer); err != nil {
 		return domain.Result{}, err
 	}
-	trace := &transferLog{workload: spec.WorkloadID, attempt: spec.AttemptID, started: time.Now(), printf: h.logf}
+	trace := &transferLog{workload: spec.WorkloadID, attempt: spec.AttemptID, batch: spec.BatchID, started: time.Now(), printf: h.logf}
 	ctx = withTrace(ctx, trace)
 	trace.admitted(len(transfer.Parts))
 	h.warmHosts(ctx, transfer.Parts)
@@ -645,36 +671,34 @@ func (h *Handler) putPresigned(ctx context.Context, part contracts.TransferPart,
 }
 
 func (h *Handler) putStream(ctx context.Context, part contracts.TransferPart, open bodyOpen, size int64, digest string) (partResult, error) {
-	// Waiting here, instead of starting every PUT in the wave, keeps each
-	// upload on a connection that can finish.
-	slotBegan := time.Now()
-	if err := h.acquireUpload(ctx); err != nil {
-		return partResult{bytes: size}, err
-	}
-	traceFrom(ctx).addSlotWait(time.Since(slotBegan))
-	defer h.releaseUpload()
+	// The send token is taken inside the body read, and given back while the
+	// download has nothing left to send. A retry keeps the same rule.
 	if putParallelProbe && size >= hedgeMinBytes {
 		return h.putParallel(ctx, part, open, size, digest)
 	}
 	if putLateProbe && size >= hedgeMinBytes {
 		replaced := 0
+		idleTries := 0
 		pace := &putPace{}
 		return h.retryPresigned(ctx, func() (partResult, error) {
 			if pace.stopped() || !replaceSlowUpload(ctx, replaced) {
-				return h.putPresignedOnce(ctx, part, open, size, digest, false, nil, pace, nil)
+				result, err := h.putPresignedOnce(ctx, part, open, size, digest, false, nil, pace, nil)
+				return result, stopIdleTries(&idleTries, err)
 			}
 			result, err := h.putLate(ctx, part, open, size, digest)
 			if errors.Is(err, errReplaced) {
 				replaced++
 			}
-			return result, err
+			return result, stopIdleTries(&idleTries, err)
 		})
 	}
 	replaced := 0
 	etagTries := 0
+	idleTries := 0
 	pace := &putPace{}
 	var waiting atomic.Bool
 	open = wrapStarved(open, &waiting)
+	ctx = context.WithValue(ctx, starveBitKey{}, &waiting)
 	return h.retryPresigned(ctx, func() (partResult, error) {
 		allow := !pace.stopped() && replaceSlowUpload(ctx, replaced)
 		// A second upload is opened only when the first is still below the
@@ -684,7 +708,7 @@ func (h *Handler) putStream(ctx context.Context, part contracts.TransferPart, op
 		if allow && size >= hedgeMinBytes && replaceSlowUpload(ctx, replaced+1) {
 			result, err, used := h.putPresignedHedged(ctx, part, open, size, digest, waiting.Load)
 			replaced += used
-			return result, err
+			return result, stopIdleTries(&idleTries, err)
 		}
 		result, err := h.putPresignedOnce(ctx, part, open, size, digest, allow, nil, pace, nil)
 		if putETagStrict && errors.Is(err, errETagMismatch) && etagTries == 0 {
@@ -694,8 +718,22 @@ func (h *Handler) putStream(ctx context.Context, part contracts.TransferPart, op
 		if errors.Is(err, errReplaced) {
 			replaced++
 		}
-		return result, err
+		return result, stopIdleTries(&idleTries, err)
 	})
+}
+
+// stopIdleTries allows two reconnects after the peer drops an idle PUT.
+// The third becomes an ordinary error so the retry loop stops. Those
+// reconnects are not upload discards.
+func stopIdleTries(tries *int, err error) error {
+	if tries == nil || !errors.Is(err, errIdleClosed) {
+		return err
+	}
+	*tries++
+	if *tries > 2 {
+		return errors.New("idle upload closed")
+	}
+	return err
 }
 
 func wrapStarved(open bodyOpen, waiting *atomic.Bool) bodyOpen {
@@ -801,7 +839,7 @@ func (h *Handler) retryPresigned(ctx context.Context, attemptFn func() (partResu
 		if ctx.Err() != nil {
 			return last, ctx.Err()
 		}
-		if errors.Is(lastErr, errStalled) || errors.Is(lastErr, errReplaced) {
+		if errors.Is(lastErr, errStalled) || errors.Is(lastErr, errReplaced) || errors.Is(lastErr, errIdleClosed) {
 			if waitErr := h.backoff(ctx, 1); waitErr != nil {
 				<-ctx.Done()
 				return last, ctx.Err()
@@ -829,8 +867,43 @@ func (h *Handler) putPresignedOnce(ctx context.Context, part contracts.TransferP
 	started := time.Now()
 	attemptCtx, cancel := context.WithCancelCause(ctx)
 	defer cancel(context.Canceled)
+	trace := traceFrom(ctx)
+	lease := h.gate.begin(trace)
+	if err := h.gate.acquireOpen(attemptCtx, lease); err != nil {
+		h.gate.end(lease)
+		return partResult{bytes: size}, err
+	}
+	defer h.gate.end(lease)
+	baseOpen := open
+	open = func(c context.Context) (io.Reader, func() bool) {
+		reader, paused := baseOpen(c)
+		if fr, ok := reader.(*followReader); ok {
+			body := newSlotBody(c, fr, lease)
+			return body, func() bool {
+				on := body.paused()
+				if bit, _ := c.Value(starveBitKey{}).(*atomic.Bool); bit != nil {
+					bit.Store(on)
+				}
+				return on
+			}
+		}
+		if err := lease.acquireSend(c); err != nil {
+			return errorReader{err}, paused
+		}
+		return reader, paused
+	}
 	reader, paused := open(attemptCtx)
-	starvedReader, _ := reader.(*followReader)
+	starvedReader, _ := reader.(interface{ starvedFor() time.Duration })
+	// The body is already here. Take the send token before the request so a
+	// second part does not open a PUT the limiter is supposed to hold back.
+	if body, ok := reader.(*slotBody); ok {
+		ahead, done, _ := body.fr.pending()
+		if (done || int64(ahead) >= uploadReacquireBytes) && !body.lease.holding() {
+			if err := body.lease.acquireSend(attemptCtx); err != nil {
+				return partResult{bytes: size}, err
+			}
+		}
+	}
 	sentMD5 := md5.New()
 	counter := &byteCounter{r: io.TeeReader(reader, sentMD5), onFirst: func() { traceFrom(ctx).moved(part.Index, "destination") }}
 	defer func() {
@@ -893,7 +966,11 @@ func (h *Handler) putPresignedOnce(ctx context.Context, part contracts.TransferP
 				func(rate float64, n int64, snap tcpSnap, decision string) {
 					traceFrom(ctx).putWindow(uploadID, partNo, snap, rate, decision)
 					if decision == "hold_rwnd" {
+						lease.setState("stalled")
 						return
+					}
+					if lease.holding() {
+						lease.setState("sending")
 					}
 					traceFrom(ctx).replaced(part.Index, "destination", "ack_stall", counter.n.Load(), int64(rate))
 					traceFrom(ctx).putDiscard(uploadID, partNo, decision, rate, n, snap)
@@ -958,6 +1035,10 @@ func (h *Handler) putPresignedOnce(ctx context.Context, part contracts.TransferP
 			return partResult{bytes: counter.n.Load()}, errReplaced
 		case errSourceReset:
 			return partResult{bytes: counter.n.Load()}, errSourceReset
+		}
+		if body, ok := reader.(*slotBody); ok && body.idleDrop(counter.n.Load()) {
+			traceFrom(ctx).idleClosed(uploadID, partNo)
+			return partResult{bytes: counter.n.Load()}, errIdleClosed
 		}
 		return partResult{bytes: size}, fmt.Errorf("write destination: %w", err)
 	}
