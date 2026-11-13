@@ -883,6 +883,7 @@ func (h *Handler) putPresignedOnce(ctx context.Context, part contracts.TransferP
 		trace.holdExpired(uploadID, partNo, age, putStatus, putRate, wnd)
 	}()
 	lease := h.gate.begin(trace)
+	lease.setUpload(uploadID)
 	if err := h.gate.acquireOpen(attemptCtx, lease); err != nil {
 		h.gate.end(lease)
 		return partResult{bytes: size}, err
@@ -1077,6 +1078,9 @@ func (h *Handler) putPresignedOnce(ctx context.Context, part contracts.TransferP
 	releaseResponse(destinationResponse, conn, drop)
 	if destinationResponse.StatusCode < 200 || destinationResponse.StatusCode >= 300 {
 		return partResult{bytes: size}, &statusError{label: "destination", status: destinationResponse.StatusCode}
+	}
+	if h.gate != nil {
+		h.gate.markDelivered(lease.batch)
 	}
 	etag := strings.Trim(destinationResponse.Header.Get("ETag"), `"`)
 	sent := hex.EncodeToString(sentMD5.Sum(nil))

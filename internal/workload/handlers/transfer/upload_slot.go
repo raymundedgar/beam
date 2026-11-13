@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log"
 	"strings"
 	"sync"
 	"time"
@@ -17,6 +18,12 @@ var (
 	uploadStarveRelease  = 400 * time.Millisecond
 	uploadReacquireBytes = int64(1 << 20)
 	uploadWaitLog        = time.Second
+	// uploadPriority replaces FIFO send-token wakeups. Off keeps the channel queue.
+	uploadPriority    = false
+	uploadPriorityAge = 5 * time.Second
+	uploadHandoff     = func(rule, waiter string, age time.Duration, queued int) {
+		log.Printf("transfer upload_handoff rule=%s waiter=%s age=%s queued=%d", rule, waiter, age.Round(time.Millisecond), queued)
+	}
 )
 
 // uploadGate is the send-token channel plus the cap on open PUT sockets.
@@ -24,11 +31,24 @@ var (
 // not have one. A handler's uploads field is read at acquire time so a test
 // can replace the channel.
 type uploadGate struct {
-	h    *Handler
-	send chan struct{}
-	open chan struct{}
-	mu   sync.Mutex
-	live []*sendLease
+	h           *Handler
+	send        chan struct{}
+	open        chan struct{}
+	mu          sync.Mutex
+	live        []*sendLease
+	waiters     []*sendWaiter
+	uploadN     map[string]int
+	batchActive map[string]int
+	delivered   map[string]bool
+}
+
+type sendWaiter struct {
+	lease    *sendLease
+	grant    chan struct{}
+	queuedAt time.Time
+	upload   string
+	batch    string
+	granted  bool
 }
 
 func newUploadGate(send, open chan struct{}) *uploadGate {
@@ -58,7 +78,7 @@ func (g *uploadGate) begin(trace *transferLog) *sendLease {
 			batch = trace.batch
 		}
 	}
-	lease := &sendLease{gate: g, task: task, batch: batch, state: "starved", since: time.Now()}
+	lease := &sendLease{gate: g, task: task, batch: batch, state: "starved", since: time.Now(), upload: "-"}
 	g.mu.Lock()
 	g.live = append(g.live, lease)
 	g.mu.Unlock()
@@ -160,6 +180,7 @@ type sendLease struct {
 	gate   *uploadGate
 	task   string
 	batch  string
+	upload string
 	mu     sync.Mutex
 	state  string
 	since  time.Time
@@ -167,6 +188,15 @@ type sendLease struct {
 	opened bool
 	takes  int
 	taken  chan struct{}
+}
+
+func (l *sendLease) setUpload(id string) {
+	if l == nil || id == "" {
+		return
+	}
+	l.mu.Lock()
+	l.upload = id
+	l.mu.Unlock()
 }
 
 func (l *sendLease) acquireSend(ctx context.Context) error {
@@ -177,7 +207,13 @@ func (l *sendLease) acquireSend(ctx context.Context) error {
 		return nil
 	}
 	ch := l.gate.sendCh()
-	if err := l.gate.take(ctx, ch, l, true); err != nil {
+	var err error
+	if uploadPriority {
+		err = l.acquirePriority(ctx, ch)
+	} else if err = l.gate.take(ctx, ch, l, true); err != nil {
+		return err
+	}
+	if err != nil {
 		return err
 	}
 	l.mu.Lock()
@@ -201,10 +237,19 @@ func (l *sendLease) releaseSend() {
 	ch := l.taken
 	l.held = false
 	l.taken = nil
+	state := l.state
+	upload, batch := l.upload, l.batch
 	l.mu.Unlock()
 	if held && ch != nil {
 		<-ch
 	}
+	if !uploadPriority || l.gate == nil {
+		return
+	}
+	if held {
+		l.gate.noteRelease(upload, batch, state)
+	}
+	l.gate.choose()
 }
 
 func (l *sendLease) holding() bool {
@@ -221,12 +266,18 @@ func (l *sendLease) setState(state string) {
 		return
 	}
 	l.mu.Lock()
-	defer l.mu.Unlock()
 	if l.state == state {
+		l.mu.Unlock()
 		return
 	}
+	prev := l.state
 	l.state = state
 	l.since = time.Now()
+	batch := l.batch
+	l.mu.Unlock()
+	if uploadPriority && l.gate != nil {
+		l.gate.noteState(batch, prev, state)
+	}
 }
 
 func (l *sendLease) snapshot() (task, batch, state string, since time.Time) {
@@ -239,6 +290,244 @@ func (l *sendLease) takesN() int {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return l.takes
+}
+
+func (g *uploadGate) markDelivered(batch string) {
+	if g == nil || batch == "" || batch == "-" {
+		return
+	}
+	g.mu.Lock()
+	if g.delivered == nil {
+		g.delivered = map[string]bool{}
+	}
+	g.delivered[batch] = true
+	g.mu.Unlock()
+}
+
+func (l *sendLease) acquirePriority(ctx context.Context, tokens chan struct{}) error {
+	w := &sendWaiter{
+		lease:    l,
+		grant:    make(chan struct{}, 1),
+		queuedAt: time.Now(),
+		upload:   l.uploadID(),
+		batch:    l.batchID(),
+	}
+	l.gate.enqueue(w)
+	l.gate.choose()
+	select {
+	case <-w.grant:
+		return nil
+	case <-ctx.Done():
+		l.gate.cancelWait(w, tokens)
+		return ctx.Err()
+	}
+}
+
+func (l *sendLease) uploadID() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.upload == "" {
+		return "-"
+	}
+	return l.upload
+}
+
+func (l *sendLease) batchID() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.batch == "" {
+		return "-"
+	}
+	return l.batch
+}
+
+func (g *uploadGate) enqueue(w *sendWaiter) {
+	g.mu.Lock()
+	g.waiters = append(g.waiters, w)
+	g.mu.Unlock()
+}
+
+func (g *uploadGate) cancelWait(w *sendWaiter, tokens chan struct{}) {
+	g.mu.Lock()
+	granted := w.granted
+	if !granted {
+		g.removeWaiter(w)
+		g.mu.Unlock()
+		return
+	}
+	g.removeWaiter(w)
+	upload, batch := w.upload, w.batch
+	g.dropInFlight(upload, batch, "sending")
+	g.mu.Unlock()
+	select {
+	case <-w.grant:
+	default:
+	}
+	if tokens != nil {
+		<-tokens
+	}
+	g.choose()
+}
+
+func (g *uploadGate) removeWaiter(w *sendWaiter) {
+	kept := g.waiters[:0]
+	for _, cur := range g.waiters {
+		if cur != w {
+			kept = append(kept, cur)
+		}
+	}
+	g.waiters = kept
+}
+
+func (g *uploadGate) noteRelease(upload, batch, state string) {
+	g.mu.Lock()
+	g.dropInFlight(upload, batch, state)
+	g.mu.Unlock()
+}
+
+func (g *uploadGate) dropInFlight(upload, batch, state string) {
+	if g.uploadN != nil && upload != "" {
+		if g.uploadN[upload] > 0 {
+			g.uploadN[upload]--
+		}
+	}
+	if state != "stalled" && state != "starved" && g.batchActive != nil && batch != "" {
+		if g.batchActive[batch] > 0 {
+			g.batchActive[batch]--
+		}
+	}
+}
+
+func (g *uploadGate) noteState(batch, prev, next string) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	if g.batchActive == nil {
+		g.batchActive = map[string]int{}
+	}
+	switch {
+	case prev == "sending" && (next == "stalled" || next == "starved"):
+		if g.batchActive[batch] > 0 {
+			g.batchActive[batch]--
+		}
+	case (prev == "stalled" || prev == "starved") && next == "sending":
+		// A grant already counted a starved lease. Only a stalled lease
+		// left the active set, so only that return adds it back.
+		if prev == "stalled" {
+			g.batchActive[batch]++
+		}
+	}
+}
+
+func (g *uploadGate) choose() {
+	if g == nil || !uploadPriority {
+		return
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	ch := g.sendCh()
+	if ch == nil {
+		return
+	}
+	for {
+		w, rule := g.pickLocked(time.Now())
+		if w == nil {
+			return
+		}
+		select {
+		case ch <- struct{}{}:
+		default:
+			return
+		}
+		w.granted = true
+		if g.uploadN == nil {
+			g.uploadN = map[string]int{}
+		}
+		if g.batchActive == nil {
+			g.batchActive = map[string]int{}
+		}
+		g.uploadN[w.upload]++
+		g.batchActive[w.batch]++
+		w.grant <- struct{}{}
+		queued := 0
+		for _, cur := range g.waiters {
+			if cur != nil && !cur.granted {
+				queued++
+			}
+		}
+		if uploadHandoff != nil {
+			uploadHandoff(rule, shortID(w.lease.task), time.Since(w.queuedAt), queued)
+		}
+	}
+}
+
+func (g *uploadGate) pickLocked(now time.Time) (*sendWaiter, string) {
+	var open []*sendWaiter
+	aged := false
+	for _, w := range g.waiters {
+		if w == nil || w.granted {
+			continue
+		}
+		open = append(open, w)
+		if now.Sub(w.queuedAt) >= uploadPriorityAge {
+			aged = true
+		}
+	}
+	if len(open) == 0 {
+		return nil, ""
+	}
+	if aged {
+		var best *sendWaiter
+		for _, w := range open {
+			if now.Sub(w.queuedAt) < uploadPriorityAge {
+				continue
+			}
+			if best == nil || w.queuedAt.Before(best.queuedAt) {
+				best = w
+			}
+		}
+		return best, "age"
+	}
+	group := open
+	empty := make([]*sendWaiter, 0, len(open))
+	for _, w := range open {
+		if g.delivered[w.batch] {
+			continue
+		}
+		if g.batchActive[w.batch] > 0 {
+			continue
+		}
+		empty = append(empty, w)
+	}
+	fromBatch := len(empty) > 0
+	if fromBatch {
+		group = empty
+	}
+	minN := g.uploadN[group[0].upload]
+	for _, w := range group[1:] {
+		if n := g.uploadN[w.upload]; n < minN {
+			minN = n
+		}
+	}
+	tied := make([]*sendWaiter, 0, len(group))
+	for _, w := range group {
+		if g.uploadN[w.upload] == minN {
+			tied = append(tied, w)
+		}
+	}
+	best := tied[0]
+	for _, w := range tied[1:] {
+		if w.queuedAt.Before(best.queuedAt) {
+			best = w
+		}
+	}
+	switch {
+	case fromBatch && len(tied) == len(group) && len(group) == 1:
+		return best, "batch"
+	case len(tied) < len(group):
+		return best, "upload"
+	default:
+		return best, "oldest"
+	}
 }
 
 func shortID(id string) string {
@@ -299,8 +588,13 @@ func (s *slotBody) Read(p []byte) (int, error) {
 				s.starvedAt = time.Now()
 			}
 			if s.lease.holding() && time.Since(s.starvedAt) >= uploadStarveRelease {
-				s.lease.releaseSend()
-				s.lease.setState("starved")
+				if uploadPriority {
+					s.lease.setState("starved")
+					s.lease.releaseSend()
+				} else {
+					s.lease.releaseSend()
+					s.lease.setState("starved")
+				}
 			}
 			limit := time.Duration(0)
 			if s.lease.holding() {

@@ -95,6 +95,14 @@ func init() {
 			}
 		}
 	}
+	uploadPriority = envBool("BEAM_WORKER_UPLOAD_PRIORITY", false)
+	if raw := os.Getenv("BEAM_WORKER_UPLOAD_PRIORITY_AGE"); raw != "" {
+		if parsed, err := time.ParseDuration(raw); err == nil && parsed >= 0 {
+			uploadPriorityAge = parsed
+		} else if secs, err := strconv.Atoi(raw); err == nil && secs >= 0 {
+			uploadPriorityAge = time.Duration(secs) * time.Second
+		}
+	}
 	if raw := os.Getenv("BEAM_WORKER_PUT_MAX_DISCARDS"); raw != "" {
 		if parsed, err := strconv.Atoi(raw); err == nil && parsed >= 0 {
 			putMaxDiscards = parsed
