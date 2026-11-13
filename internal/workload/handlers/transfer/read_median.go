@@ -99,6 +99,13 @@ func (p *readPace) block(rate float64) bool {
 	if p.stopped {
 		return true
 	}
+	// Below the keep rate the search must continue. Two slow sockets in a
+	// row are not a reason to give up on finding a faster one.
+	if rate < float64(readKeepMinRate) {
+		p.misses = 0
+		p.prev = rate
+		return false
+	}
 	if p.prev > 0 && rate <= p.prev {
 		p.misses++
 		if p.misses >= 2 {
@@ -115,6 +122,23 @@ func (p *readPace) block(rate float64) bool {
 // readRestartWorth is true when finishing the remainder at the current wire
 // rate costs more than 1.5 times a full re-read at the host median. A socket
 // that is 95% done stays, because the re-read starts at byte 0.
+// readFastEnough reports that this socket is already quick enough to finish
+// a part inside the usual batch cut, so replacing it costs more than it saves.
+func readFastEnough(moved int64, elapsed time.Duration) bool {
+	if readKeepMinRate <= 0 || moved <= 0 || elapsed <= 0 {
+		return false
+	}
+	return float64(moved)/elapsed.Seconds() >= float64(readKeepMinRate)
+}
+
+// keepMeasuredRate applies that keep to the 8s probe. A test budget of a
+// millisecond still replaces a socket that cannot meet it. The production
+// budget is 8s, which is shorter than the batch cut, so a steady 5 MiB/s
+// read would otherwise be discarded.
+func keepMeasuredRate(budget time.Duration, moved int64, elapsed time.Duration) bool {
+	return budget >= time.Second && readFastEnough(moved, elapsed)
+}
+
 func readRestartWorth(have, total int64, current, median float64) bool {
 	if median <= 0 || current <= 0 || total <= 0 || have >= total || have < 0 {
 		return false
@@ -175,6 +199,10 @@ func watchReadMedian(ctx context.Context, cancel context.CancelCauseFunc, moved 
 			continue
 		}
 		rate := float64(delta)
+		if readFastEnough(delta, time.Second) {
+			traceFrom(ctx).readKeep(host, "rate", got, rate, med)
+			continue
+		}
 		if !readRestartWorth(got, total, rate, med) {
 			continue
 		}

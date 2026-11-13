@@ -48,6 +48,10 @@ var (
 	readMedian       = true
 	readRestartCap   = 10
 	readMedianFactor = 1.5
+	// readKeepMinRate is the download rate, in bytes per second, that is left
+	// alone. A 48 MiB part at 5 MiB/s finishes the read in about 10 seconds.
+	// Slower sockets are still replaced. BEAM_WORKER_READ_KEEP_RATE is MiB/s.
+	readKeepMinRate int64 = 5 << 20
 	// readResetNoETag resets the upload when a 206 drops and the response had
 	// no ETag. A matching ETag keeps the prefix either way.
 	readResetNoETag = true
@@ -67,6 +71,11 @@ func init() {
 	readMedian = envBool("BEAM_WORKER_READ_MEDIAN", true)
 	readResetNoETag = envBool("BEAM_WORKER_READ_RESET_NO_ETAG", true)
 	putETagStrict = envBool("BEAM_WORKER_PUT_ETAG_STRICT", false)
+	if raw := os.Getenv("BEAM_WORKER_READ_KEEP_RATE"); raw != "" {
+		if parsed, err := strconv.ParseFloat(raw, 64); err == nil && parsed >= 0 {
+			readKeepMinRate = int64(parsed * (1 << 20))
+		}
+	}
 	if raw := os.Getenv("BEAM_WORKER_READ_RESTARTS"); raw != "" {
 		if parsed, err := strconv.Atoi(raw); err == nil && parsed >= 0 {
 			readRestartCap = parsed

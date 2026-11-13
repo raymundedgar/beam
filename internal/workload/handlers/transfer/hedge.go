@@ -99,7 +99,7 @@ func watchSourceRate(ctx context.Context, cancel context.CancelCauseFunc, moved 
 		return
 	case <-timer.C:
 	}
-	if !mostlyReceived(moved.Load(), total) && moved.Load() > 0 && rateTooSlow(moved.Load(), total, early, budget*2, minBytes) {
+	if !keepMeasuredRate(budget, moved.Load(), early) && !mostlyReceived(moved.Load(), total) && moved.Load() > 0 && rateTooSlow(moved.Load(), total, early, budget*2, minBytes) {
 		cancel(errReplaced)
 		return
 	}
@@ -120,7 +120,8 @@ func watchSourceRate(ctx context.Context, cancel context.CancelCauseFunc, moved 
 	defer ticker.Stop()
 	started := time.Now().Add(-probe)
 	for {
-		if !mostlyReceived(moved.Load(), total) && rateTooSlow(moved.Load(), total, time.Since(started), budget, minBytes) {
+		elapsed := time.Since(started)
+		if !keepMeasuredRate(budget, moved.Load(), elapsed) && !mostlyReceived(moved.Load(), total) && rateTooSlow(moved.Load(), total, elapsed, budget, minBytes) {
 			cancel(errReplaced)
 			return
 		}

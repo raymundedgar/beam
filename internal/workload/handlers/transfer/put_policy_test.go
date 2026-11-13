@@ -131,14 +131,49 @@ func TestFullRereadKeepsANearlyFinishedSlowRead(t *testing.T) {
 
 func TestTwoDisappointingRestartsStop(t *testing.T) {
 	var pace readPace
-	if pace.block(1 << 20) {
-		t.Fatal("the first slow socket was not allowed to restart")
+	fast := float64(6 << 20)
+	if pace.block(fast) {
+		t.Fatal("the first socket was not allowed to restart")
 	}
-	if pace.block(1 << 20) {
-		t.Fatal("the first replacement that tied the previous rate stopped immediately")
+	if pace.block(fast) {
+		t.Fatal("a replacement that tied the previous rate stopped immediately")
 	}
-	if !pace.block(512 << 10) {
-		t.Fatal("a second slower replacement was restarted again")
+	if !pace.block(float64(5 << 20)) {
+		t.Fatal("a second slower replacement above the keep rate was restarted again")
+	}
+}
+
+func TestSlowSocketsDoNotStopTheSearch(t *testing.T) {
+	var pace readPace
+	for i := 0; i < 4; i++ {
+		if pace.block(float64(1 << 20)) {
+			t.Fatal("a 1 MiB/s socket stopped the search")
+		}
+	}
+	if pace.done() {
+		t.Fatal("slow sockets latched the thrash guard")
+	}
+}
+
+func TestFiveMiBPerSecondIsKept(t *testing.T) {
+	if !readFastEnough(5<<20, time.Second) {
+		t.Fatal("5 MiB in one second was replaceable")
+	}
+	if readFastEnough(4<<20, time.Second) {
+		t.Fatal("4 MiB/s was kept")
+	}
+	// 7.5 MiB in 1.5s is 5 MiB/s. The 8s budget still calls that too slow for a
+	// 48 MiB part, and the probe must not follow it.
+	moved := int64(15 << 20 / 2)
+	elapsed := 1500 * time.Millisecond
+	if !readFastEnough(moved, elapsed) {
+		t.Fatal("5 MiB/s over the probe interval was replaceable")
+	}
+	if !rateTooSlow(moved, 48<<20, elapsed, 8*time.Second, 1<<20) {
+		t.Fatal("the 8s budget no longer calls 5 MiB/s slow")
+	}
+	if readFastEnough(3<<20/2, elapsed) {
+		t.Fatal("1.5 MiB/s was kept")
 	}
 }
 
