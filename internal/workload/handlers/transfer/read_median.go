@@ -168,6 +168,7 @@ func watchReadMedian(ctx context.Context, cancel context.CancelCauseFunc, moved 
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 	var prev int64
+	var prevAt time.Time
 	var saw bool
 	var notedEmpty bool
 	for {
@@ -176,18 +177,20 @@ func watchReadMedian(ctx context.Context, cancel context.CancelCauseFunc, moved 
 			return
 		case <-ticker.C:
 		}
+		now := time.Now()
 		n := moved.Load()
 		if !saw {
-			prev, saw = n, true
+			prev, prevAt, saw = n, now, true
 			continue
 		}
 		delta := n - prev
-		prev = n
+		elapsed := now.Sub(prevAt)
+		prev, prevAt = n, now
 		if delta < 0 {
 			delta = 0
 		}
 		got := have()
-		if got >= total || got < hedgeMinBytes {
+		if got >= total || got < hedgeMinBytes || elapsed <= 0 {
 			continue
 		}
 		med := readHosts.median(host)
@@ -198,8 +201,8 @@ func watchReadMedian(ctx context.Context, cancel context.CancelCauseFunc, moved 
 			}
 			continue
 		}
-		rate := float64(delta)
-		if readFastEnough(delta, time.Second) {
+		rate := float64(delta) / elapsed.Seconds()
+		if readFastEnough(delta, elapsed) {
 			traceFrom(ctx).readKeep(host, "rate", got, rate, med)
 			continue
 		}

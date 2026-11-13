@@ -197,6 +197,19 @@ func TestPutAckProgressAndHalfwayAreKept(t *testing.T) {
 	}
 }
 
+func TestProbeDecisionKeepsFiveAndDropsOne(t *testing.T) {
+	elapsed := 1500 * time.Millisecond
+	budget := 8 * time.Second
+	five := int64(15 << 20 / 2)
+	if !keepMeasuredRate(budget, five, elapsed) || !rateTooSlow(five, 48<<20, elapsed, budget, 1<<20) {
+		t.Fatal("the probe would not keep a 5 MiB/s read that misses the 8s budget")
+	}
+	one := int64(15 << 20 / 10)
+	if keepMeasuredRate(budget, one, elapsed) || !rateTooSlow(one, 48<<20, elapsed, budget, 1<<20) {
+		t.Fatal("the probe would keep a 1 MiB/s read")
+	}
+}
+
 func TestSourcePastHalfwayIsKept(t *testing.T) {
 	ctx, cancel := context.WithCancelCause(context.Background())
 	var moved atomic.Int64

@@ -175,6 +175,12 @@ func TestFiveMiBPerSecondIsKept(t *testing.T) {
 	if readFastEnough(3<<20/2, elapsed) {
 		t.Fatal("1.5 MiB/s was kept")
 	}
+	if readFastEnough(6<<20, 2*time.Second) {
+		t.Fatal("6 MiB over two seconds was treated as 6 MiB/s")
+	}
+	if keepMeasuredRate(time.Millisecond, 5<<20, time.Second) {
+		t.Fatal("a one-millisecond budget kept a fast socket")
+	}
 }
 
 func TestProvenUploadNeedsFourSlowSeconds(t *testing.T) {
