@@ -37,8 +37,54 @@ type tcpSnap struct {
 // putPace remembers the last discarded upload's recent rate. A replacement that
 // is not faster is kept, and no further socket is discarded for this part.
 type putPace struct {
-	prev atomic.Int64
-	stop atomic.Bool
+	prev         atomic.Int64
+	stop         atomic.Bool
+	holdDiscards atomic.Int32
+	pendingHold  atomic.Int64
+	reportHold   atomic.Int64
+	sawWnd       atomic.Bool
+}
+
+func (p *putPace) holds() int {
+	if p == nil {
+		return 0
+	}
+	return int(p.holdDiscards.Load())
+}
+
+func (p *putPace) markHold(age time.Duration) {
+	if p == nil {
+		return
+	}
+	p.holdDiscards.Add(1)
+	p.pendingHold.Store(int64(age))
+}
+
+func (p *putPace) beginHoldReport() {
+	if p == nil {
+		return
+	}
+	p.sawWnd.Store(false)
+	if age := p.pendingHold.Swap(0); age > 0 {
+		p.reportHold.Store(age)
+	}
+}
+
+func (p *putPace) finishHoldReport() (time.Duration, bool, bool) {
+	if p == nil {
+		return 0, false, false
+	}
+	age := p.reportHold.Swap(0)
+	if age == 0 {
+		return 0, false, false
+	}
+	return time.Duration(age), true, p.sawWnd.Load()
+}
+
+func (p *putPace) noteWindow() {
+	if p != nil {
+		p.sawWnd.Store(true)
+	}
 }
 
 func (p *putPace) notFaster(bytesPerSec int64) bool {
@@ -135,7 +181,22 @@ const putTailZero = 8
 // lasts before the socket is discarded anyway.
 const tinyPeerWindow = 16 << 10
 
-const putHoldCap = 25 * time.Second
+// putHoldCap is how long a non-tail upload waits on a closed peer window
+// before it is discarded. The tail always uses putHoldTailCap. Set with
+// BEAM_WORKER_PUT_HOLD_MAX. putHoldDiscardMax is separate from the slow-ack
+// discard cap.
+var putHoldCap = 25 * time.Second
+
+const putHoldTailCap = 25 * time.Second
+
+const putHoldDiscardMax = 2
+
+func holdLimit(progress, total int64) time.Duration {
+	if putInTail(progress, total) || putHoldCap <= 0 {
+		return putHoldTailCap
+	}
+	return putHoldCap
+}
 
 func peerWindowBlocked(s tcpSnap) bool {
 	if !s.ok {
@@ -154,7 +215,7 @@ func (w *ackWindows) reset(now time.Time, acked int64) {
 // A socket that has already moved 16 MiB needs four slow seconds. Two slow
 // seconds discard a socket that has not. A replacement that is not faster than
 // the socket it replaced is kept.
-func watchPutRecent(ctx context.Context, cancel context.CancelCauseFunc, total int64, window time.Duration, minRate int64, acked func() (int64, bool), snapFn func() tcpSnap, paused func() bool, pace *putPace, onSample func(rate float64, acked int64), onStall func(rate float64, acked int64, snap tcpSnap, decision string, holdFor time.Duration, progress int64), onLate func()) {
+func watchPutRecent(ctx context.Context, cancel context.CancelCauseFunc, total int64, window time.Duration, minRate int64, acked func() (int64, bool), snapFn func() tcpSnap, paused func() bool, pace *putPace, onSample func(rate float64, acked int64), onStall func(rate float64, acked int64, snap tcpSnap, decision string, holdFor time.Duration, progress int64), onLate func(), allowDiscard bool) {
 	if window <= 0 || acked == nil {
 		return
 	}
@@ -233,7 +294,10 @@ func watchPutRecent(ctx context.Context, cancel context.CancelCauseFunc, total i
 					holdSince = now
 				}
 				held := now.Sub(holdSince)
-				if held < putHoldCap {
+				if pace != nil {
+					pace.noteWindow()
+				}
+				if held < holdLimit(progress, total) || pace.holds() >= putHoldDiscardMax {
 					if onStall != nil {
 						onStall(rate, n, snap, "hold_rwnd", held, progress)
 					}
@@ -243,11 +307,18 @@ func watchPutRecent(ctx context.Context, cancel context.CancelCauseFunc, total i
 					lateSent = true
 					onLate()
 				}
+				if pace != nil {
+					pace.markHold(held)
+				}
 				if onStall != nil {
 					onStall(rate, n, snap, "hold_expired", held, progress)
 				}
-			} else {
-				holdSince = time.Time{}
+				cancel(errHoldExpired)
+				return
+			}
+			holdSince = time.Time{}
+			if !allowDiscard {
+				continue
 			}
 			if pace.notFaster(int64(rate)) {
 				continue

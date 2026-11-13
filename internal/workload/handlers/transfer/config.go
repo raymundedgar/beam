@@ -83,6 +83,18 @@ func init() {
 			readRestartCap = parsed
 		}
 	}
+	if raw := os.Getenv("BEAM_WORKER_PUT_HOLD_MAX"); raw != "" {
+		switch raw {
+		case "0", "off":
+			putHoldCap = 0
+		default:
+			if parsed, err := time.ParseDuration(raw); err == nil && parsed >= 0 {
+				putHoldCap = parsed
+			} else if secs, err := strconv.Atoi(raw); err == nil && secs >= 0 {
+				putHoldCap = time.Duration(secs) * time.Second
+			}
+		}
+	}
 	if raw := os.Getenv("BEAM_WORKER_PUT_MAX_DISCARDS"); raw != "" {
 		if parsed, err := strconv.Atoi(raw); err == nil && parsed >= 0 {
 			putMaxDiscards = parsed

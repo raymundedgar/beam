@@ -840,7 +840,7 @@ func (h *Handler) retryPresigned(ctx context.Context, attemptFn func() (partResu
 		if ctx.Err() != nil {
 			return last, ctx.Err()
 		}
-		if errors.Is(lastErr, errStalled) || errors.Is(lastErr, errReplaced) || errors.Is(lastErr, errIdleClosed) {
+		if errors.Is(lastErr, errStalled) || errors.Is(lastErr, errReplaced) || errors.Is(lastErr, errIdleClosed) || errors.Is(lastErr, errHoldExpired) {
 			if waitErr := h.backoff(ctx, 1); waitErr != nil {
 				<-ctx.Done()
 				return last, ctx.Err()
@@ -869,6 +869,19 @@ func (h *Handler) putPresignedOnce(ctx context.Context, part contracts.TransferP
 	attemptCtx, cancel := context.WithCancelCause(ctx)
 	defer cancel(context.Canceled)
 	trace := traceFrom(ctx)
+	var putStatus int
+	var putRate float64
+	uploadID, partNo := uploadRef(part.Destination.URL)
+	if pace != nil {
+		pace.beginHoldReport()
+	}
+	defer func() {
+		age, ok, wnd := pace.finishHoldReport()
+		if !ok {
+			return
+		}
+		trace.holdExpired(uploadID, partNo, age, putStatus, putRate, wnd)
+	}()
 	lease := h.gate.begin(trace)
 	if err := h.gate.acquireOpen(attemptCtx, lease); err != nil {
 		h.gate.end(lease)
@@ -918,12 +931,11 @@ func (h *Handler) putPresignedOnce(ctx context.Context, part contracts.TransferP
 	var ackMoved atomic.Int64
 	var ackBase atomic.Int64
 	ackMoved.Store(time.Now().UnixNano())
-	uploadID, partNo := uploadRef(part.Destination.URL)
 	if size >= hedgeMinBytes {
 		quiet, minRate := putAckQuiet, putAckMinRate
 		total := size
 		var stallCancel context.CancelCauseFunc
-		if allowReplace {
+		if allowReplace || pace.holds() < putHoldDiscardMax {
 			stallCancel = cancel
 		}
 		sampleAck := func() (int64, bool) {
@@ -975,7 +987,7 @@ func (h *Handler) putPresignedOnce(ctx context.Context, part contracts.TransferP
 					}
 					traceFrom(ctx).replaced(part.Index, "destination", "ack_stall", counter.n.Load(), int64(rate))
 					traceFrom(ctx).putDiscard(uploadID, partNo, decision, rate, n, snap)
-				}, onLate)
+				}, onLate, allowReplace)
 		} else {
 			go watchPutAck(attemptCtx, stallCancel, &counter.n, total, quiet, minRate, sampleAck, func(written, acked int64) {
 				traceFrom(ctx).replaced(part.Index, "destination", "ack_stall", written, acked)
@@ -1032,6 +1044,8 @@ func (h *Handler) putPresignedOnce(ctx context.Context, part contracts.TransferP
 			return partResult{bytes: size}, ctx.Err()
 		}
 		switch context.Cause(attemptCtx) {
+		case errHoldExpired:
+			return partResult{bytes: counter.n.Load()}, errHoldExpired
 		case errReplaced:
 			return partResult{bytes: counter.n.Load()}, errReplaced
 		case errSourceReset:
@@ -1054,6 +1068,10 @@ func (h *Handler) putPresignedOnce(ctx context.Context, part contracts.TransferP
 	starvedFor := time.Duration(0)
 	if starvedReader != nil {
 		starvedFor = starvedReader.starvedFor()
+	}
+	putStatus = destinationResponse.StatusCode
+	if time.Since(started) > 0 && acked > 0 {
+		putRate = float64(acked) / time.Since(started).Seconds() / (1024 * 1024)
 	}
 	traceFrom(ctx).putAttempt(remoteIP(conn), cfColo(destinationResponse.Header), bucketOf(part.Destination.URL), uploadID, partNo, reason, snap, acked, starvedFor)
 	releaseResponse(destinationResponse, conn, drop)

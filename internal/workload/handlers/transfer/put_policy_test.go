@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -156,16 +157,72 @@ func TestSlowSocketsDoNotStopTheSearch(t *testing.T) {
 	}
 }
 
+func TestNonTailHoldUsesItsOwnCounter(t *testing.T) {
+	prev := putHoldCap
+	putHoldCap = 50 * time.Millisecond
+	t.Cleanup(func() { putHoldCap = prev })
+	expire := func(pace *putPace) error {
+		ctx, cancel := context.WithCancelCause(context.Background())
+		var wg sync.WaitGroup
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			watchPutRecent(ctx, cancel, 50<<20, 20*time.Millisecond, 1<<30,
+				func() (int64, bool) { return 1000, true },
+				func() tcpSnap { return tcpSnap{ok: true, sndWnd: 0, unacked: 4} },
+				nil, pace, nil,
+				func(float64, int64, tcpSnap, string, time.Duration, int64) {},
+				nil, true)
+		}()
+		var err error
+		select {
+		case <-ctx.Done():
+			err = context.Cause(ctx)
+		case <-time.After(time.Second):
+			err = nil
+		}
+		cancel(context.Canceled)
+		wg.Wait()
+		return err
+	}
+	pace := &putPace{}
+	if err := expire(pace); err != errHoldExpired {
+		t.Fatalf("first hold = %v", err)
+	}
+	if pace.holds() != 1 || pace.prev.Load() != 0 {
+		t.Fatalf("hold counted as a slow discard holds=%d prev=%d", pace.holds(), pace.prev.Load())
+	}
+	if err := expire(pace); err != errHoldExpired {
+		t.Fatalf("second hold = %v", err)
+	}
+	if err := expire(pace); err != nil {
+		t.Fatalf("third hold still expired: %v", err)
+	}
+}
+
+func TestTailHoldKeepsTheLongCap(t *testing.T) {
+	prev := putHoldCap
+	putHoldCap = 50 * time.Millisecond
+	t.Cleanup(func() { putHoldCap = prev })
+	if holdLimit(10<<20, 50<<20) != putHoldCap {
+		t.Fatal("a non-tail upload ignored the configured cap")
+	}
+	if holdLimit(45<<20, 50<<20) != putHoldTailCap {
+		t.Fatal("a tail upload used the short cap")
+	}
+}
+
 func TestHoldAndReadLinesCarryTheMeasuredFields(t *testing.T) {
 	var lines []string
 	trace := &transferLog{workload: "w", attempt: "a", printf: func(format string, args ...any) {
 		lines = append(lines, fmt.Sprintf(format, args...))
 	}}
 	trace.putWindow("up", "1", tcpSnap{ok: true, sndWnd: 0}, 1<<20, "hold_rwnd", 8<<20, 48<<20, 3200*time.Millisecond)
+	trace.holdExpired("up", "1", 3200*time.Millisecond, 200, 21.5, false)
 	trace.readKeep("cdn.example", "rate", 10<<20, 6<<20, 30<<20, 0)
 	trace.readRestart("cdn.example", 12<<20, 3<<20, 30<<20, 2)
 	got := strings.Join(lines, "\n")
-	for _, want := range []string{"decision=hold_rwnd", "progress=8388608", "total=50331648", "hold_age=3.2s", "keep_mib=5", "below=0", "below=2"} {
+	for _, want := range []string{"decision=hold_rwnd", "progress=8388608", "total=50331648", "hold_age=3.2s", "hold_age_ms=3200", "status=200", "rate_mib=21.50", "wnd0=false", "keep_mib=5", "below=0", "below=2"} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("missing %s in %s", want, got)
 		}

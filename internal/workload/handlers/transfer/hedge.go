@@ -50,6 +50,10 @@ var (
 // The signed GET is repeated. It is not a task result.
 var errReplaced = errors.New("slow source connection closed")
 
+// errHoldExpired discards an upload whose peer window stayed closed. It is
+// not one of the slow-ack discards, and the part is sent again from the buffer.
+var errHoldExpired = errors.New("upload hold expired")
+
 // errSourceReset aborts the upload because the download was not a valid
 // continuation. It is not an upload discard and does not use the discard cap.
 var errSourceReset = errors.New("source reset")

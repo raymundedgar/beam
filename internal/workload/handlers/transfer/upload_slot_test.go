@@ -159,7 +159,7 @@ func TestWaitingForATokenIsNotDiscarded(t *testing.T) {
 		func() bool { return true },
 		nil, nil,
 		func(float64, int64, tcpSnap, string, time.Duration, int64) { stalls++ },
-		nil)
+		nil, false)
 	time.Sleep(150 * time.Millisecond)
 	if stalls != 0 {
 		t.Fatalf("stalls=%d", stalls)
