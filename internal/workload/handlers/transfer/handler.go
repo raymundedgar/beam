@@ -964,8 +964,8 @@ func (h *Handler) putPresignedOnce(ctx context.Context, part contracts.TransferP
 				func(rate float64, n int64) {
 					traceFrom(ctx).putSample(uploadID, partNo, rate, n)
 				},
-				func(rate float64, n int64, snap tcpSnap, decision string) {
-					traceFrom(ctx).putWindow(uploadID, partNo, snap, rate, decision)
+				func(rate float64, n int64, snap tcpSnap, decision string, holdFor time.Duration, progress int64) {
+					traceFrom(ctx).putWindow(uploadID, partNo, snap, rate, decision, progress, total, holdFor)
 					if decision == "hold_rwnd" {
 						lease.setState("stalled")
 						return

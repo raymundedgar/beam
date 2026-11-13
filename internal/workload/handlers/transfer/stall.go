@@ -253,28 +253,28 @@ func (t *transferLog) putDiscard(upload, part, reason string, bytesPerSec float6
 		t.workload, t.attempt, upload, part, reason, acked, bytesPerSec/(1024*1024), snap.sndWnd, snap.rtoUs, snap.backoff, snap.unacked)
 }
 
-func (t *transferLog) putWindow(upload, part string, snap tcpSnap, bytesPerSec float64, decision string) {
+func (t *transferLog) putWindow(upload, part string, snap tcpSnap, bytesPerSec float64, decision string, progress, total int64, holdFor time.Duration) {
 	if t == nil {
 		return
 	}
-	t.out("transfer put_window workload=%s attempt=%s upload=%s part_no=%s snd_wnd=%d rto_us=%d backoff=%d unacked=%d rate_1s=%.2f decision=%s build=%s",
-		t.workload, t.attempt, upload, part, snap.sndWnd, snap.rtoUs, snap.backoff, snap.unacked, bytesPerSec/(1024*1024), decision, buildID)
+	t.out("transfer put_window workload=%s attempt=%s upload=%s part_no=%s snd_wnd=%d rto_us=%d backoff=%d unacked=%d rate_1s=%.2f decision=%s progress=%d total=%d hold_age=%s build=%s",
+		t.workload, t.attempt, upload, part, snap.sndWnd, snap.rtoUs, snap.backoff, snap.unacked, bytesPerSec/(1024*1024), decision, progress, total, holdFor.Round(time.Millisecond), buildID)
 }
 
-func (t *transferLog) readRestart(host string, have int64, bytesPerSec, median float64) {
+func (t *transferLog) readRestart(host string, have int64, bytesPerSec, median float64, below int) {
 	if t == nil {
 		return
 	}
-	t.out("transfer read_restart workload=%s attempt=%s host=%s have=%d rate_1s=%.2f median=%.2f build=%s",
-		t.workload, t.attempt, host, have, bytesPerSec/(1024*1024), median/(1024*1024), buildID)
+	t.out("transfer read_restart workload=%s attempt=%s host=%s have=%d rate_1s=%.2f median=%.2f keep_mib=%d below=%d build=%s",
+		t.workload, t.attempt, host, have, bytesPerSec/(1024*1024), median/(1024*1024), readKeepMinRate>>20, below, buildID)
 }
 
-func (t *transferLog) readKeep(host, reason string, have int64, bytesPerSec, median float64) {
+func (t *transferLog) readKeep(host, reason string, have int64, bytesPerSec, median float64, below int) {
 	if t == nil {
 		return
 	}
-	t.out("transfer read_keep workload=%s attempt=%s host=%s reason=%s have=%d rate_1s=%.2f median=%.2f build=%s",
-		t.workload, t.attempt, host, reason, have, bytesPerSec/(1024*1024), median/(1024*1024), buildID)
+	t.out("transfer read_keep workload=%s attempt=%s host=%s reason=%s have=%d rate_1s=%.2f median=%.2f keep_mib=%d below=%d build=%s",
+		t.workload, t.attempt, host, reason, have, bytesPerSec/(1024*1024), median/(1024*1024), readKeepMinRate>>20, below, buildID)
 }
 
 func (t *transferLog) readMedianEmpty(host string) {

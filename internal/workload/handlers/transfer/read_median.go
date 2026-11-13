@@ -171,6 +171,7 @@ func watchReadMedian(ctx context.Context, cancel context.CancelCauseFunc, moved 
 	var prevAt time.Time
 	var saw bool
 	var notedEmpty bool
+	var below int
 	for {
 		select {
 		case <-ctx.Done():
@@ -203,21 +204,23 @@ func watchReadMedian(ctx context.Context, cancel context.CancelCauseFunc, moved 
 		}
 		rate := float64(delta) / elapsed.Seconds()
 		if readFastEnough(delta, elapsed) {
-			traceFrom(ctx).readKeep(host, "rate", got, rate, med)
+			below = 0
+			traceFrom(ctx).readKeep(host, "rate", got, rate, med, below)
 			continue
 		}
+		below++
 		if !readRestartWorth(got, total, rate, med) {
 			continue
 		}
 		if !restartFitsLease(ctx, total, med) {
-			traceFrom(ctx).readKeep(host, "lease", got, rate, med)
+			traceFrom(ctx).readKeep(host, "lease", got, rate, med, below)
 			continue
 		}
 		if pace != nil && pace.block(rate) {
-			traceFrom(ctx).readKeep(host, "thrash", got, rate, med)
+			traceFrom(ctx).readKeep(host, "thrash", got, rate, med, below)
 			continue
 		}
-		traceFrom(ctx).readRestart(host, got, rate, med)
+		traceFrom(ctx).readRestart(host, got, rate, med, below)
 		cancel(errReplaced)
 		return
 	}

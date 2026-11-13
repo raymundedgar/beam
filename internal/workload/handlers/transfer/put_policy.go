@@ -154,7 +154,7 @@ func (w *ackWindows) reset(now time.Time, acked int64) {
 // A socket that has already moved 16 MiB needs four slow seconds. Two slow
 // seconds discard a socket that has not. A replacement that is not faster than
 // the socket it replaced is kept.
-func watchPutRecent(ctx context.Context, cancel context.CancelCauseFunc, total int64, window time.Duration, minRate int64, acked func() (int64, bool), snapFn func() tcpSnap, paused func() bool, pace *putPace, onSample func(rate float64, acked int64), onStall func(rate float64, acked int64, snap tcpSnap, decision string), onLate func()) {
+func watchPutRecent(ctx context.Context, cancel context.CancelCauseFunc, total int64, window time.Duration, minRate int64, acked func() (int64, bool), snapFn func() tcpSnap, paused func() bool, pace *putPace, onSample func(rate float64, acked int64), onStall func(rate float64, acked int64, snap tcpSnap, decision string, holdFor time.Duration, progress int64), onLate func()) {
 	if window <= 0 || acked == nil {
 		return
 	}
@@ -232,9 +232,10 @@ func watchPutRecent(ctx context.Context, cancel context.CancelCauseFunc, total i
 				if holdSince.IsZero() {
 					holdSince = now
 				}
-				if now.Sub(holdSince) < putHoldCap {
+				held := now.Sub(holdSince)
+				if held < putHoldCap {
 					if onStall != nil {
-						onStall(rate, n, snap, "hold_rwnd")
+						onStall(rate, n, snap, "hold_rwnd", held, progress)
 					}
 					continue
 				}
@@ -243,7 +244,7 @@ func watchPutRecent(ctx context.Context, cancel context.CancelCauseFunc, total i
 					onLate()
 				}
 				if onStall != nil {
-					onStall(rate, n, snap, "hold_expired")
+					onStall(rate, n, snap, "hold_expired", held, progress)
 				}
 			} else {
 				holdSince = time.Time{}
@@ -253,7 +254,7 @@ func watchPutRecent(ctx context.Context, cancel context.CancelCauseFunc, total i
 			}
 			pace.discarded(int64(rate))
 			if onStall != nil && !peerWindowBlocked(snap) {
-				onStall(rate, n, snap, "discard")
+				onStall(rate, n, snap, "discard", 0, progress)
 			}
 			cancel(errReplaced)
 			return

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -152,6 +153,22 @@ func TestSlowSocketsDoNotStopTheSearch(t *testing.T) {
 	}
 	if pace.done() {
 		t.Fatal("slow sockets latched the thrash guard")
+	}
+}
+
+func TestHoldAndReadLinesCarryTheMeasuredFields(t *testing.T) {
+	var lines []string
+	trace := &transferLog{workload: "w", attempt: "a", printf: func(format string, args ...any) {
+		lines = append(lines, fmt.Sprintf(format, args...))
+	}}
+	trace.putWindow("up", "1", tcpSnap{ok: true, sndWnd: 0}, 1<<20, "hold_rwnd", 8<<20, 48<<20, 3200*time.Millisecond)
+	trace.readKeep("cdn.example", "rate", 10<<20, 6<<20, 30<<20, 0)
+	trace.readRestart("cdn.example", 12<<20, 3<<20, 30<<20, 2)
+	got := strings.Join(lines, "\n")
+	for _, want := range []string{"decision=hold_rwnd", "progress=8388608", "total=50331648", "hold_age=3.2s", "keep_mib=5", "below=0", "below=2"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("missing %s in %s", want, got)
+		}
 	}
 }
 
