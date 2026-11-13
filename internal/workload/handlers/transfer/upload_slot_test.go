@@ -157,7 +157,7 @@ func TestWaitingForATokenIsNotDiscarded(t *testing.T) {
 		func() (int64, bool) { return 0, true },
 		func() tcpSnap { return tcpSnap{ok: true, unacked: 10} },
 		func() bool { return true },
-		nil, nil,
+		nil, nil, nil,
 		func(float64, int64, tcpSnap, string, time.Duration, int64) { stalls++ },
 		nil, false)
 	time.Sleep(150 * time.Millisecond)

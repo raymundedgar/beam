@@ -245,12 +245,13 @@ func (t *transferLog) putSample(upload, part string, bytesPerSec float64, acked 
 		t.workload, t.attempt, upload, part, acked, bytesPerSec/(1024*1024))
 }
 
-func (t *transferLog) holdExpired(upload, part string, age time.Duration, status int, rate float64, wnd bool) {
+func (t *transferLog) holdExpired(upload, part string, age time.Duration, status int, rate float64, dur time.Duration, wnd bool) {
 	if t == nil {
 		return
 	}
-	t.out("transfer hold_expired workload=%s attempt=%s upload=%s part_no=%s hold_age_ms=%d status=%d rate_mib=%.2f wnd0=%t build=%s",
-		t.workload, t.attempt, upload, part, age.Milliseconds(), status, rate, wnd, buildID)
+	// status, rate, and dur are the attempt that ran after the hold expired.
+	t.out("transfer hold_expired workload=%s attempt=%s upload=%s part_no=%s hold_age_ms=%d status=%d rate_mib=%.2f dur_ms=%d wnd0=%t build=%s",
+		t.workload, t.attempt, upload, part, age.Milliseconds(), status, rate, dur.Milliseconds(), wnd, buildID)
 }
 
 func (t *transferLog) putDiscard(upload, part, reason string, bytesPerSec float64, acked int64, snap tcpSnap) {

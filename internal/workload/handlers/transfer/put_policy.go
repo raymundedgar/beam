@@ -60,25 +60,15 @@ func (p *putPace) markHold(age time.Duration) {
 	p.pendingHold.Store(int64(age))
 }
 
-func (p *putPace) beginHoldReport() {
+func (p *putPace) takeHold() (time.Duration, bool) {
 	if p == nil {
-		return
+		return 0, false
 	}
-	p.sawWnd.Store(false)
-	if age := p.pendingHold.Swap(0); age > 0 {
-		p.reportHold.Store(age)
-	}
-}
-
-func (p *putPace) finishHoldReport() (time.Duration, bool, bool) {
-	if p == nil {
-		return 0, false, false
-	}
-	age := p.reportHold.Swap(0)
+	age := p.pendingHold.Swap(0)
 	if age == 0 {
-		return 0, false, false
+		return 0, false
 	}
-	return time.Duration(age), true, p.sawWnd.Load()
+	return time.Duration(age), true
 }
 
 func (p *putPace) noteWindow() {
@@ -187,6 +177,12 @@ const tinyPeerWindow = 16 << 10
 // discard cap.
 var putHoldCap = 25 * time.Second
 
+// putHoldResponseCap is how long a fully written body may sit with a closed
+// window waiting for the response. On successful PUTs the last acknowledgement
+// was 0.44s before the response at the median and 2.7s at p95. A 4s cap covers
+// that body and still drops the 10–12s waits that ended with no status.
+var putHoldResponseCap = 4 * time.Second
+
 const putHoldTailCap = 25 * time.Second
 
 const putHoldDiscardMax = 2
@@ -215,7 +211,7 @@ func (w *ackWindows) reset(now time.Time, acked int64) {
 // A socket that has already moved 16 MiB needs four slow seconds. Two slow
 // seconds discard a socket that has not. A replacement that is not faster than
 // the socket it replaced is kept.
-func watchPutRecent(ctx context.Context, cancel context.CancelCauseFunc, total int64, window time.Duration, minRate int64, acked func() (int64, bool), snapFn func() tcpSnap, paused func() bool, pace *putPace, onSample func(rate float64, acked int64), onStall func(rate float64, acked int64, snap tcpSnap, decision string, holdFor time.Duration, progress int64), onLate func(), allowDiscard bool) {
+func watchPutRecent(ctx context.Context, cancel context.CancelCauseFunc, total int64, window time.Duration, minRate int64, acked func() (int64, bool), snapFn func() tcpSnap, paused func() bool, bodyDone func() bool, pace *putPace, onSample func(rate float64, acked int64), onStall func(rate float64, acked int64, snap tcpSnap, decision string, holdFor time.Duration, progress int64), onLate func(), allowDiscard bool) {
 	if window <= 0 || acked == nil {
 		return
 	}
@@ -232,7 +228,13 @@ func watchPutRecent(ctx context.Context, cancel context.CancelCauseFunc, total i
 	attemptAcked := int64(-1)
 	var zeros int
 	lateSent := false
-	var holdSince time.Time
+	// held counts only ticks where the window is closed and this attempt still
+	// has body bytes to send. respHeld counts a fully written body waiting for
+	// the response. An open window clears both, including ticks that skip the
+	// rate sample.
+	var held, respHeld time.Duration
+	var prev time.Time
+	var loggedHold time.Duration
 	for {
 		select {
 		case <-ctx.Done():
@@ -245,11 +247,68 @@ func watchPutRecent(ctx context.Context, cancel context.CancelCauseFunc, total i
 			if attemptAcked < 0 {
 				attemptAcked = n
 			}
+			dt := time.Duration(0)
+			if !prev.IsZero() {
+				dt = now.Sub(prev)
+				if dt < 0 {
+					dt = 0
+				}
+			}
+			prev = now
+			progress := n - attemptAcked
+			var snap tcpSnap
+			if snapFn != nil {
+				snap = snapFn()
+			}
+			if snap.ok && !peerWindowBlocked(snap) {
+				held = 0
+				respHeld = 0
+				loggedHold = 0
+			} else if snap.ok && peerWindowBlocked(snap) {
+				// A closed window with the body still queued counts even when
+				// every byte already handed to TCP has been acknowledged.
+				sending := (paused == nil || !paused()) && (bodyDone == nil || !bodyDone())
+				if bodyDone != nil && bodyDone() {
+					held = 0
+					loggedHold = 0
+					respHeld += dt
+					if cancel != nil && respHeld >= putHoldResponseCap && (pace == nil || pace.holds() < putHoldDiscardMax) {
+						if pace != nil {
+							pace.markHold(respHeld)
+						}
+						if onStall != nil {
+							onStall(0, n, snap, "hold_expired", respHeld, progress)
+						}
+						cancel(errHoldExpired)
+						return
+					}
+				} else if sending {
+					held += dt
+					if pace != nil {
+						pace.noteWindow()
+					}
+					limit := holdLimit(progress, total)
+					if cancel != nil && held >= limit && (pace == nil || pace.holds() < putHoldDiscardMax) {
+						if pace != nil {
+							pace.markHold(held)
+						}
+						if onStall != nil {
+							onStall(0, n, snap, "hold_expired", held, progress)
+						}
+						cancel(errHoldExpired)
+						return
+					}
+					if onStall != nil && held-loggedHold >= time.Second {
+						onStall(0, n, snap, "hold_rwnd", held, progress)
+						loggedHold = held
+					}
+				}
+				continue
+			}
 			if paused != nil && paused() {
 				windows.reset(now, n)
 				continue
 			}
-			progress := n - attemptAcked
 			sampled, rate, lows := windows.push(now, n, window, float64(minRate))
 			if !sampled {
 				continue
@@ -257,12 +316,10 @@ func watchPutRecent(ctx context.Context, cancel context.CancelCauseFunc, total i
 			if onSample != nil {
 				onSample(rate, n)
 			}
-			if rate == 0 && snapFn != nil && !putInTail(progress, total) {
-				if snap := snapFn(); snap.ok && snap.unacked == 0 {
-					windows.reset(now, n)
-					zeros = 0
-					continue
-				}
+			if rate == 0 && snap.ok && snap.unacked == 0 && !putInTail(progress, total) {
+				windows.reset(now, n)
+				zeros = 0
+				continue
 			}
 			if rate == 0 {
 				zeros++
@@ -278,46 +335,11 @@ func watchPutRecent(ctx context.Context, cancel context.CancelCauseFunc, total i
 				stall = zeros >= putTailZero
 			}
 			// A late probe keeps this socket up through a 2s silence. A zero
-			// window still discards after the 8s tail wait.
+			// window still discards after the hold cap above.
 			if onLate != nil && rate == 0 && zeros < putTailZero {
 				stall = false
 			}
-			if !stall || cancel == nil {
-				continue
-			}
-			var snap tcpSnap
-			if snapFn != nil {
-				snap = snapFn()
-			}
-			if peerWindowBlocked(snap) {
-				if holdSince.IsZero() {
-					holdSince = now
-				}
-				held := now.Sub(holdSince)
-				if pace != nil {
-					pace.noteWindow()
-				}
-				if held < holdLimit(progress, total) || pace.holds() >= putHoldDiscardMax {
-					if onStall != nil {
-						onStall(rate, n, snap, "hold_rwnd", held, progress)
-					}
-					continue
-				}
-				if onLate != nil && !lateSent {
-					lateSent = true
-					onLate()
-				}
-				if pace != nil {
-					pace.markHold(held)
-				}
-				if onStall != nil {
-					onStall(rate, n, snap, "hold_expired", held, progress)
-				}
-				cancel(errHoldExpired)
-				return
-			}
-			holdSince = time.Time{}
-			if !allowDiscard {
+			if !stall || cancel == nil || !allowDiscard {
 				continue
 			}
 			if pace.notFaster(int64(rate)) {

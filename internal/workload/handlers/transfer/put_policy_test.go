@@ -12,6 +12,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/Beam-Network/beam/internal/workload/contracts"
 )
 
 func TestPolicyStampUsesTheEmbeddedRevision(t *testing.T) {
@@ -170,7 +172,7 @@ func TestNonTailHoldUsesItsOwnCounter(t *testing.T) {
 			watchPutRecent(ctx, cancel, 50<<20, 20*time.Millisecond, 1<<30,
 				func() (int64, bool) { return 1000, true },
 				func() tcpSnap { return tcpSnap{ok: true, sndWnd: 0, unacked: 4} },
-				nil, pace, nil,
+				nil, nil, pace, nil,
 				func(float64, int64, tcpSnap, string, time.Duration, int64) {},
 				nil, true)
 		}()
@@ -200,6 +202,101 @@ func TestNonTailHoldUsesItsOwnCounter(t *testing.T) {
 	}
 }
 
+func TestStarvedReaderDoesNotAdvanceTheHoldClock(t *testing.T) {
+	prev := putHoldCap
+	putHoldCap = 40 * time.Millisecond
+	t.Cleanup(func() { putHoldCap = prev })
+	ctx, cancel := context.WithCancelCause(context.Background())
+	defer cancel(context.Canceled)
+	go watchPutRecent(ctx, cancel, 50<<20, 20*time.Millisecond, 1<<30,
+		func() (int64, bool) { return 1000, true },
+		func() tcpSnap { return tcpSnap{ok: true, sndWnd: 0, unacked: 8} },
+		func() bool { return true }, nil, &putPace{}, nil, nil, nil, true)
+	time.Sleep(200 * time.Millisecond)
+	if context.Cause(ctx) == errHoldExpired {
+		t.Fatal("a starved reader advanced the hold clock")
+	}
+}
+
+func TestQueuedBodyAdvancesTheHoldClockWhenEveryByteIsAcked(t *testing.T) {
+	prev := putHoldCap
+	putHoldCap = 40 * time.Millisecond
+	t.Cleanup(func() { putHoldCap = prev })
+	ctx, cancel := context.WithCancelCause(context.Background())
+	defer cancel(context.Canceled)
+	go watchPutRecent(ctx, cancel, 50<<20, 20*time.Millisecond, 1<<30,
+		func() (int64, bool) { return 1000, true },
+		func() tcpSnap { return tcpSnap{ok: true, sndWnd: 0, unacked: 0} },
+		nil, func() bool { return false }, &putPace{}, nil, nil, nil, true)
+	select {
+	case <-ctx.Done():
+		if context.Cause(ctx) != errHoldExpired {
+			t.Fatalf("cause = %v", context.Cause(ctx))
+		}
+	case <-time.After(time.Second):
+		t.Fatal("a closed window with more body queued did not expire")
+	}
+}
+
+func TestSkippedTickDoesNotDelayHoldExpiry(t *testing.T) {
+	prev := putHoldCap
+	putHoldCap = 300 * time.Millisecond
+	t.Cleanup(func() { putHoldCap = prev })
+	ctx, cancel := context.WithCancelCause(context.Background())
+	defer cancel(context.Canceled)
+	// A 1s sample window used to skip every tick until the first sample, so a
+	// 300ms cap could not fire until that sample. The ticker is 250ms.
+	go watchPutRecent(ctx, cancel, 50<<20, time.Second, 1<<30,
+		func() (int64, bool) { return 1000, true },
+		func() tcpSnap { return tcpSnap{ok: true, sndWnd: 0, unacked: 8} },
+		nil, nil, &putPace{}, nil, nil, nil, true)
+	select {
+	case <-ctx.Done():
+		if context.Cause(ctx) != errHoldExpired {
+			t.Fatalf("cause = %v", context.Cause(ctx))
+		}
+	case <-time.After(1200 * time.Millisecond):
+		t.Fatal("closed-window time waited for the rate sample")
+	}
+}
+
+func TestWrittenBodyUsesTheResponseCap(t *testing.T) {
+	prevHold, prevResp := putHoldCap, putHoldResponseCap
+	t.Cleanup(func() {
+		putHoldCap = prevHold
+		putHoldResponseCap = prevResp
+	})
+	putHoldCap = 30 * time.Millisecond
+	putHoldResponseCap = 2 * time.Second
+	ctx, cancel := context.WithCancelCause(context.Background())
+	go watchPutRecent(ctx, cancel, 50<<20, 20*time.Millisecond, 1<<30,
+		func() (int64, bool) { return 1000, true },
+		func() tcpSnap { return tcpSnap{ok: true, sndWnd: 0, unacked: 0} },
+		nil, func() bool { return true }, &putPace{}, nil, nil, nil, true)
+	time.Sleep(200 * time.Millisecond)
+	if context.Cause(ctx) == errHoldExpired {
+		t.Fatal("a written body used the send cap")
+	}
+	cancel(context.Canceled)
+
+	putHoldCap = 10 * time.Second
+	putHoldResponseCap = 40 * time.Millisecond
+	ctx, cancel = context.WithCancelCause(context.Background())
+	defer cancel(context.Canceled)
+	go watchPutRecent(ctx, cancel, 50<<20, 20*time.Millisecond, 1<<30,
+		func() (int64, bool) { return 1000, true },
+		func() tcpSnap { return tcpSnap{ok: true, sndWnd: 0, unacked: 0} },
+		nil, func() bool { return true }, &putPace{}, nil, nil, nil, true)
+	select {
+	case <-ctx.Done():
+		if context.Cause(ctx) != errHoldExpired {
+			t.Fatalf("cause = %v", context.Cause(ctx))
+		}
+	case <-time.After(time.Second):
+		t.Fatal("a written body ignored the response cap")
+	}
+}
+
 func TestTailHoldKeepsTheLongCap(t *testing.T) {
 	prev := putHoldCap
 	putHoldCap = 50 * time.Millisecond
@@ -218,11 +315,36 @@ func TestHoldAndReadLinesCarryTheMeasuredFields(t *testing.T) {
 		lines = append(lines, fmt.Sprintf(format, args...))
 	}}
 	trace.putWindow("up", "1", tcpSnap{ok: true, sndWnd: 0}, 1<<20, "hold_rwnd", 8<<20, 48<<20, 3200*time.Millisecond)
-	trace.holdExpired("up", "1", 3200*time.Millisecond, 200, 21.5, false)
+	trace.holdExpired("up", "1", 3200*time.Millisecond, 200, 21.5, 1700*time.Millisecond, false)
 	trace.readKeep("cdn.example", "rate", 10<<20, 6<<20, 30<<20, 0)
 	trace.readRestart("cdn.example", 12<<20, 3<<20, 30<<20, 2)
 	got := strings.Join(lines, "\n")
-	for _, want := range []string{"decision=hold_rwnd", "progress=8388608", "total=50331648", "hold_age=3.2s", "hold_age_ms=3200", "status=200", "rate_mib=21.50", "wnd0=false", "keep_mib=5", "below=0", "below=2"} {
+	for _, want := range []string{"decision=hold_rwnd", "progress=8388608", "total=50331648", "hold_age=3.2s", "hold_age_ms=3200", "status=200", "rate_mib=21.50", "dur_ms=1700", "wnd0=false", "keep_mib=5", "below=0", "below=2"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("missing %s in %s", want, got)
+		}
+	}
+}
+
+func TestHoldFollowupLogsTheNextAttempt(t *testing.T) {
+	var lines []string
+	trace := &transferLog{workload: "w", attempt: "a", printf: func(format string, args ...any) {
+		lines = append(lines, fmt.Sprintf(format, args...))
+	}}
+	pace := &putPace{}
+	pace.markHold(4500 * time.Millisecond)
+	part := contracts.TransferPart{}
+	var owed time.Duration
+	noteHoldFollowup(trace, part, &owed, pace, partResult{}, errHoldExpired, time.Second)
+	if owed != 4500*time.Millisecond || len(lines) != 0 {
+		t.Fatalf("expiry logged itself owed=%s lines=%v", owed, lines)
+	}
+	noteHoldFollowup(trace, part, &owed, pace, partResult{httpStatus: 200, ackRate: 21.5}, nil, 1700*time.Millisecond)
+	if owed != 0 {
+		t.Fatal("the follow-up did not consume the hold")
+	}
+	got := strings.Join(lines, "\n")
+	for _, want := range []string{"hold_age_ms=4500", "status=200", "rate_mib=21.50", "dur_ms=1700"} {
 		if !strings.Contains(got, want) {
 			t.Fatalf("missing %s in %s", want, got)
 		}

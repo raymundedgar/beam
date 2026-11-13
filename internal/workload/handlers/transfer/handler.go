@@ -337,6 +337,9 @@ type partResult struct {
 	sha1           string
 	requests       int
 	providerPartID string
+	httpStatus     int
+	ackRate        float64
+	wndClosed      bool
 }
 
 // record writes a part's evidence outputs. Authenticated destinations always report
@@ -681,12 +684,16 @@ func (h *Handler) putStream(ctx context.Context, part contracts.TransferPart, op
 		replaced := 0
 		idleTries := 0
 		pace := &putPace{}
+		var owed time.Duration
 		return h.retryPresigned(ctx, func() (partResult, error) {
+			started := time.Now()
 			if pace.stopped() || !replaceSlowUpload(ctx, replaced) {
 				result, err := h.putPresignedOnce(ctx, part, open, size, digest, false, nil, pace, nil)
+				noteHoldFollowup(traceFrom(ctx), part, &owed, pace, result, err, time.Since(started))
 				return result, stopIdleTries(&idleTries, err)
 			}
 			result, err := h.putLate(ctx, part, open, size, digest)
+			noteHoldFollowup(traceFrom(ctx), part, &owed, pace, result, err, time.Since(started))
 			if errors.Is(err, errReplaced) {
 				replaced++
 			}
@@ -697,10 +704,12 @@ func (h *Handler) putStream(ctx context.Context, part contracts.TransferPart, op
 	etagTries := 0
 	idleTries := 0
 	pace := &putPace{}
+	var owed time.Duration
 	var waiting atomic.Bool
 	open = wrapStarved(open, &waiting)
 	ctx = context.WithValue(ctx, starveBitKey{}, &waiting)
 	return h.retryPresigned(ctx, func() (partResult, error) {
+		started := time.Now()
 		allow := !pace.stopped() && replaceSlowUpload(ctx, replaced)
 		// A second upload is opened only when the first is still below the
 		// acknowledgement floor halfway through the probe, and only while two
@@ -709,6 +718,7 @@ func (h *Handler) putStream(ctx context.Context, part contracts.TransferPart, op
 		if allow && size >= hedgeMinBytes && replaceSlowUpload(ctx, replaced+1) {
 			result, err, used := h.putPresignedHedged(ctx, part, open, size, digest, waiting.Load)
 			replaced += used
+			noteHoldFollowup(traceFrom(ctx), part, &owed, pace, result, err, time.Since(started))
 			return result, stopIdleTries(&idleTries, err)
 		}
 		result, err := h.putPresignedOnce(ctx, part, open, size, digest, allow, nil, pace, nil)
@@ -716,6 +726,7 @@ func (h *Handler) putStream(ctx context.Context, part contracts.TransferPart, op
 			etagTries++
 			result, err = h.putPresignedOnce(ctx, part, open, size, digest, allow, nil, pace, nil)
 		}
+		noteHoldFollowup(traceFrom(ctx), part, &owed, pace, result, err, time.Since(started))
 		if errors.Is(err, errReplaced) {
 			replaced++
 		}
@@ -872,16 +883,6 @@ func (h *Handler) putPresignedOnce(ctx context.Context, part contracts.TransferP
 	var putStatus int
 	var putRate float64
 	uploadID, partNo := uploadRef(part.Destination.URL)
-	if pace != nil {
-		pace.beginHoldReport()
-	}
-	defer func() {
-		age, ok, wnd := pace.finishHoldReport()
-		if !ok {
-			return
-		}
-		trace.holdExpired(uploadID, partNo, age, putStatus, putRate, wnd)
-	}()
 	lease := h.gate.begin(trace)
 	lease.setUpload(uploadID)
 	if err := h.gate.acquireOpen(attemptCtx, lease); err != nil {
@@ -973,7 +974,9 @@ func (h *Handler) putPresignedOnce(ctx context.Context, part contracts.TransferP
 			return readTCP(conn)
 		}
 		if putPolicy {
-			go watchPutRecent(attemptCtx, stallCancel, total, putWindow, minRate, sampleAck, snapNow, paused, pace,
+			go watchPutRecent(attemptCtx, stallCancel, total, putWindow, minRate, sampleAck, snapNow, paused, func() bool {
+				return size > 0 && counter.n.Load() >= size
+			}, pace,
 				func(rate float64, n int64) {
 					traceFrom(ctx).putSample(uploadID, partNo, rate, n)
 				},
@@ -1046,9 +1049,9 @@ func (h *Handler) putPresignedOnce(ctx context.Context, part contracts.TransferP
 		}
 		switch context.Cause(attemptCtx) {
 		case errHoldExpired:
-			return partResult{bytes: counter.n.Load()}, errHoldExpired
+			return partResult{bytes: counter.n.Load(), ackRate: ackRate(acked, time.Since(started)), wndClosed: peerWindowBlocked(snap)}, errHoldExpired
 		case errReplaced:
-			return partResult{bytes: counter.n.Load()}, errReplaced
+			return partResult{bytes: counter.n.Load(), ackRate: ackRate(acked, time.Since(started)), wndClosed: peerWindowBlocked(snap)}, errReplaced
 		case errSourceReset:
 			return partResult{bytes: counter.n.Load()}, errSourceReset
 		}
@@ -1071,13 +1074,11 @@ func (h *Handler) putPresignedOnce(ctx context.Context, part contracts.TransferP
 		starvedFor = starvedReader.starvedFor()
 	}
 	putStatus = destinationResponse.StatusCode
-	if time.Since(started) > 0 && acked > 0 {
-		putRate = float64(acked) / time.Since(started).Seconds() / (1024 * 1024)
-	}
+	putRate = ackRate(acked, time.Since(started))
 	traceFrom(ctx).putAttempt(remoteIP(conn), cfColo(destinationResponse.Header), bucketOf(part.Destination.URL), uploadID, partNo, reason, snap, acked, starvedFor)
 	releaseResponse(destinationResponse, conn, drop)
 	if destinationResponse.StatusCode < 200 || destinationResponse.StatusCode >= 300 {
-		return partResult{bytes: size}, &statusError{label: "destination", status: destinationResponse.StatusCode}
+		return partResult{bytes: size, httpStatus: putStatus, ackRate: putRate, wndClosed: peerWindowBlocked(snap)}, &statusError{label: "destination", status: destinationResponse.StatusCode}
 	}
 	if h.gate != nil {
 		h.gate.markDelivered(lease.batch)
@@ -1093,8 +1094,36 @@ func (h *Handler) putPresignedOnce(ctx context.Context, part contracts.TransferP
 	}
 	return partResult{
 		bytes: size, sha256: digest,
-		etag: etag,
+		etag:       etag,
+		httpStatus: putStatus, ackRate: putRate, wndClosed: peerWindowBlocked(snap),
 	}, nil
+}
+
+func ackRate(acked int64, dur time.Duration) float64 {
+	if acked <= 0 || dur <= 0 {
+		return 0
+	}
+	return float64(acked) / dur.Seconds() / (1024 * 1024)
+}
+
+// noteHoldFollowup logs the attempt that ran after a closed window was discarded.
+// The hold age is the socket that expired. Status, rate, and duration are this attempt.
+func noteHoldFollowup(trace *transferLog, part contracts.TransferPart, owed *time.Duration, pace *putPace, result partResult, err error, dur time.Duration) {
+	if owed != nil && *owed > 0 && trace != nil {
+		upload, partNo := uploadRef(part.Destination.URL)
+		status := result.httpStatus
+		if err == nil && status == 0 {
+			status = 200
+		}
+		trace.holdExpired(upload, partNo, *owed, status, result.ackRate, dur, result.wndClosed)
+		*owed = 0
+	}
+	if pace == nil || owed == nil || !errors.Is(err, errHoldExpired) {
+		return
+	}
+	if age, ok := pace.takeHold(); ok {
+		*owed = age
+	}
 }
 
 // dropSlowUpload reports that this upload socket should not be reused. A 5xx
