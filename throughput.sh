@@ -537,10 +537,16 @@ def last_wave(rows):
     wave.reverse()
     return wave
 
-def emphasize(text):
+def paint(text, code):
     if not sys.stdout.isatty():
         return text
-    return f"\033[1;31m{text}\033[0m"
+    return f"\033[{code}m{text}\033[0m"
+
+def emphasize(text):
+    return paint(text, "1;31")
+
+def complete(text):
+    return paint(text, "1;32")
 
 def print_rows(rows):
     if not rows:
@@ -559,7 +565,9 @@ def print_rows(rows):
             f"{(row.get('region') or '—'):<14} {(row.get('upload') or '—'):<10} "
             f"{(row.get('stop') or '—'):<18} {row.get('slow') or '—'}"
         )
-        if row["state"] != "completed" and not row["in_flight"]:
+        if row["state"] == "completed":
+            line = complete(line)
+        elif not row["in_flight"]:
             line = emphasize(line)
         print(line)
 
