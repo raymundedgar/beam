@@ -17,7 +17,10 @@ import (
 // 800ms, opened connections that had not sent a byte and slowed the whole wave.
 // The 12:37 AM wave was cancelled on the sixth download, still reading at
 // 0.5–2 MiB/s, while other tasks in that wave finished a download at 14–39.
-const maxSourceReplacements = 6
+// maxSourceReplacements is how many times the 1.5s probe may discard a slow
+// download. BEAM_WORKER_READ_PROBE_REPLACEMENTS overrides it. The median
+// restart cap is separate and is usually higher.
+var maxSourceReplacements = 6
 
 // putReplacements caps how many times a slow upload is discarded. The signed
 // request is repeated from the start on a new connection. The cap stops a

@@ -66,7 +66,7 @@ func TestHandlerStopsPresignedRetries(t *testing.T) {
 		puts    int32
 		err     string
 	}{
-		"attempts exhausted": {status: http.StatusInternalServerError, puts: presignedAttempts, err: "part 1: destination returned HTTP 500"},
+		"attempts exhausted": {status: http.StatusInternalServerError, puts: int32(presignedAttempts), err: "part 1: destination returned HTTP 500"},
 		"refused":            {status: http.StatusForbidden, puts: 1, err: "part 1: destination returned HTTP 403"},
 		"lease ends":         {status: http.StatusServiceUnavailable, timeout: 100 * time.Millisecond, puts: 1, err: "part 1: destination returned HTTP 503"},
 	} {

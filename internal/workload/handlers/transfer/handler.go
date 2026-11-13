@@ -36,9 +36,10 @@ const multipartCheckpointSchema = "beam.transfer.multipart/1"
 // broken GET can resume with Range and If-Range instead of starting over.
 const maxResumablePart = 64 << 20
 
-// presignedAttempts is the number of tries for one presigned part, shared with
-// the upstream retry budget.
-const presignedAttempts = 3
+// presignedAttempts is the number of tries for one presigned part, for both the
+// download and the upload. HTTP 408, 429, and 5xx stop after this many tries.
+// BEAM_WORKER_HTTP_ATTEMPTS overrides it. A stall is not counted here.
+var presignedAttempts = 3
 
 type multipartCheckpoint struct {
 	Parts map[string]partCheckpoint `json:"parts"`

@@ -63,8 +63,8 @@ func revisionFromBuildInfo() string {
 }
 
 func policyStamp() string {
-	return fmt.Sprintf("build=%s read_median=%t read_restarts=%d read_race=%t reset_no_etag=%t put_policy=%t put_discards=%d put_etag_strict=%t put_late=%t early_put=%t",
-		buildID, readMedian, readRestartCap, readRace, readResetNoETag, putPolicy, putDiscardCap(), putETagStrict, putLateProbe, earlyPut)
+	return fmt.Sprintf("build=%s read_median=%t read_probe_replacements=%d read_restarts=%d read_keep_mib=%d http_attempts=%d read_race=%t reset_no_etag=%t put_policy=%t put_discards=%d put_etag_strict=%t put_late=%t early_put=%t",
+		buildID, readMedian, maxSourceReplacements, readRestartCap, readKeepMinRate>>20, presignedAttempts, readRace, readResetNoETag, putPolicy, putDiscardCap(), putETagStrict, putLateProbe, earlyPut)
 }
 
 var policyOnce sync.Once

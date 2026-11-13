@@ -71,6 +71,8 @@ func init() {
 	readMedian = envBool("BEAM_WORKER_READ_MEDIAN", true)
 	readResetNoETag = envBool("BEAM_WORKER_READ_RESET_NO_ETAG", true)
 	putETagStrict = envBool("BEAM_WORKER_PUT_ETAG_STRICT", false)
+	envNonNegative("BEAM_WORKER_READ_PROBE_REPLACEMENTS", &maxSourceReplacements)
+	envAtLeastOne("BEAM_WORKER_HTTP_ATTEMPTS", &presignedAttempts)
 	if raw := os.Getenv("BEAM_WORKER_READ_KEEP_RATE"); raw != "" {
 		if parsed, err := strconv.ParseFloat(raw, 64); err == nil && parsed >= 0 {
 			readKeepMinRate = int64(parsed * (1 << 20))
@@ -98,6 +100,30 @@ func init() {
 			earlyPutBytes = parsed
 		}
 	}
+}
+
+func envNonNegative(key string, dst *int) {
+	raw := os.Getenv(key)
+	if raw == "" || dst == nil {
+		return
+	}
+	parsed, err := strconv.Atoi(raw)
+	if err != nil || parsed < 0 {
+		return
+	}
+	*dst = parsed
+}
+
+func envAtLeastOne(key string, dst *int) {
+	raw := os.Getenv(key)
+	if raw == "" || dst == nil {
+		return
+	}
+	parsed, err := strconv.Atoi(raw)
+	if err != nil || parsed < 1 {
+		return
+	}
+	*dst = parsed
 }
 
 func envBool(key string, fallback bool) bool {
