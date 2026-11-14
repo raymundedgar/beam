@@ -17,7 +17,12 @@ import (
 var (
 	uploadStarveRelease  = 400 * time.Millisecond
 	uploadReacquireBytes = int64(1 << 20)
-	uploadWaitLog        = time.Second
+	// uploadIdleDropAfter is how long a PUT may have waited on the download,
+	// in total, before a transport error on it is read as the peer dropping an
+	// idle upload. R2 closes a PUT whose body stops arriving, whatever was
+	// sent before the pause, so the size sent so far cannot rule that out.
+	uploadIdleDropAfter = 5 * time.Second
+	uploadWaitLog       = time.Second
 	// uploadPriority replaces FIFO send-token wakeups. Off keeps the channel queue.
 	uploadPriority    = false
 	uploadPriorityAge = 5 * time.Second
@@ -628,9 +633,15 @@ func (s *slotBody) starvedFor() time.Duration {
 	return s.fr.starvedFor()
 }
 
-// idleDrop reports that this attempt failed before it had sent a meaningful
-// amount. A PUT that already handed the transport a megabyte failed while it
-// was sending, and that stays a normal error.
+// idleDrop reports that this attempt failed because the peer dropped a PUT
+// that was waiting on the download. That is the case when the attempt failed
+// before it had sent a meaningful amount, and also when the body spent
+// uploadIdleDropAfter or longer waiting on the download: an idle socket is
+// closed by the peer after more than a megabyte has been sent just as it is
+// after less. A PUT that handed the transport a megabyte and was not starved
+// that long failed while it was sending, and that stays a normal error.
+// The part is sent again from the first buffered byte, so a wrong guess costs
+// one resend, which stopIdleTries bounds.
 func (s *slotBody) idleDrop(written int64) bool {
 	if s == nil || s.lease == nil {
 		return false
@@ -638,7 +649,11 @@ func (s *slotBody) idleDrop(written int64) bool {
 	if s.lease.takesN() == 0 {
 		return true
 	}
-	return s.starvedFor() >= uploadStarveRelease && written < uploadReacquireBytes
+	starved := s.starvedFor()
+	if uploadIdleDropAfter > 0 && starved >= uploadIdleDropAfter {
+		return true
+	}
+	return starved >= uploadStarveRelease && written < uploadReacquireBytes
 }
 
 type starveBitKey struct{}

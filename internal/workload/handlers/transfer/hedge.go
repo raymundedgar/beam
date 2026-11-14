@@ -22,6 +22,15 @@ import (
 // restart cap is separate and is usually higher.
 var maxSourceReplacements = 6
 
+// readFreezeMax is how long a download that an upload is following may go
+// without buffering a new byte before it stops being replaced. A replacement
+// repeats the signed GET from byte 0 and the buffer cannot grow until it has
+// re-read the bytes already held, so each replacement freezes the upload for
+// that whole prefix. Replacing a moving socket over and over starved the
+// uploads of 14-19s, long enough for R2 to drop them, and the part failed.
+// Past this point the current socket is left to finish.
+var readFreezeMax = 3 * time.Second
+
 // putReplacements caps how many times a slow upload is discarded. The signed
 // request is repeated from the start on a new connection. The cap stops a
 // path that is slow every time from restarting until the offer ends with

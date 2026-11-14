@@ -427,7 +427,17 @@ func (h *Handler) readSourcePublish(ctx context.Context, part contracts.Transfer
 		// worker would report as its own failure.
 		// A slow connection is closed and the signed GET is repeated. Bytes
 		// already buffered stay, and the upload keeps reading them.
-		body, err := h.readSourceOnce(ctx, part, replacements < maxSourceReplacements, replacements < readRestartCap && !pace.done(), buf, &pace, &stamp)
+		// An upload that has gone readFreezeMax with no new bytes is already
+		// near the peer's idle limit. Another restart re-reads the prefix
+		// before the buffer grows, so stop replacing and let this socket run.
+		frozen := false
+		if buf != nil && readFreezeMax > 0 {
+			if idle := buf.frozenFor(); idle >= readFreezeMax {
+				frozen = true
+				traceFrom(ctx).readFrozen(buf.Len(), idle)
+			}
+		}
+		body, err := h.readSourceOnce(ctx, part, replacements < maxSourceReplacements && !frozen, replacements < readRestartCap && !pace.done() && !frozen, buf, &pace, &stamp)
 		if err == nil {
 			if buf != nil {
 				buf.finish()

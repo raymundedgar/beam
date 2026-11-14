@@ -286,6 +286,14 @@ func (t *transferLog) readKeep(host, reason string, have int64, bytesPerSec, med
 		t.workload, t.attempt, host, reason, have, bytesPerSec/(1024*1024), median/(1024*1024), readKeepMinRate>>20, below, buildID)
 }
 
+func (t *transferLog) readFrozen(have int64, idle time.Duration) {
+	if t == nil {
+		return
+	}
+	t.out("transfer read_frozen workload=%s attempt=%s have=%d idle=%s build=%s",
+		t.workload, t.attempt, have, idle.Round(time.Millisecond), buildID)
+}
+
 func (t *transferLog) readMedianEmpty(host string) {
 	if t == nil {
 		return

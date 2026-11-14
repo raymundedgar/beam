@@ -62,11 +62,12 @@ func readInto(r io.Reader, buf *followBuffer, total int64, ctx context.Context) 
 // PUT cannot resume, so a discarded upload reads this buffer again from the
 // start instead of opening another GET.
 type followBuffer struct {
-	mu   sync.Mutex
-	cond *sync.Cond
-	buf  []byte
-	done bool
-	err  error
+	mu    sync.Mutex
+	cond  *sync.Cond
+	buf   []byte
+	done  bool
+	err   error
+	wrote time.Time
 }
 
 func newFollowBuffer(n int64) *followBuffer {
@@ -74,7 +75,7 @@ func newFollowBuffer(n int64) *followBuffer {
 	if n < 0 || int64(capn) != n {
 		capn = 0
 	}
-	b := &followBuffer{buf: make([]byte, 0, capn)}
+	b := &followBuffer{buf: make([]byte, 0, capn), wrote: time.Now()}
 	b.cond = sync.NewCond(&b.mu)
 	return b
 }
@@ -89,6 +90,7 @@ func (b *followBuffer) Write(p []byte) (int, error) {
 		return 0, io.ErrClosedPipe
 	}
 	b.buf = append(b.buf, p...)
+	b.wrote = time.Now()
 	b.cond.Broadcast()
 	return len(p), nil
 }
@@ -107,6 +109,7 @@ func (b *followBuffer) reset() {
 	b.buf = b.buf[:0]
 	b.done = false
 	b.err = nil
+	b.wrote = time.Now()
 	b.cond.Broadcast()
 	b.mu.Unlock()
 }
@@ -127,6 +130,21 @@ func (b *followBuffer) Len() int64 {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return int64(len(b.buf))
+}
+
+// frozenFor is how long a buffer that already holds bytes has gone without a
+// new one. An upload that is following it has been waiting that long. An empty,
+// finished, or failed buffer is not frozen: nothing is waiting on it.
+func (b *followBuffer) frozenFor() time.Duration {
+	if b == nil {
+		return 0
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if len(b.buf) == 0 || b.done || b.err != nil {
+		return 0
+	}
+	return time.Since(b.wrote)
 }
 
 func (b *followBuffer) bytes() []byte {
