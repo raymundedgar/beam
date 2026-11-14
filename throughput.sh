@@ -259,38 +259,13 @@ def regions_of(task):
         return src if src == dst else f"{src}>{dst}"
     return src or dst or "—"
 
-def upload_of(task):
-    payload = payload_of(task)
-    found = []
-
-    def add(url):
-        if not isinstance(url, str) or "upload" not in url.lower():
-            return
-        try:
-            query = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)
-        except ValueError:
-            return
-        uid = (query.get("uploadId") or query.get("upload_id") or [""])[0]
-        if not uid:
-            return
-        short = hashlib.sha256(uid.encode()).hexdigest()[:8]
-        if short not in found:
-            found.append(short)
-
-    parts = payload.get("parts")
-    if isinstance(parts, list):
-        for part in parts:
-            if isinstance(part, dict):
-                dest = part.get("destination") if isinstance(part.get("destination"), dict) else {}
-                add(dest.get("url"))
-    for key in ("destinations", "targets"):
-        items = payload.get(key)
-        if not isinstance(items, list):
-            continue
-        for item in items:
-            if isinstance(item, dict):
-                add(item.get("url") or (item.get("endpoint") or {}).get("url") if isinstance(item.get("endpoint"), dict) else item.get("url"))
-    return "+".join(found) if found else "—"
+def batch_id_of(task):
+    raw = task.get("batch_id")
+    if not raw and isinstance(task.get("spec"), dict):
+        raw = task["spec"].get("batch_id")
+    if isinstance(raw, str) and raw.strip():
+        return raw.strip()
+    return "—"
 
 def kind_of(task):
     base = ((task.get("spec") or {}).get("kind") or "-")
@@ -398,10 +373,11 @@ def enrich(task, medians, sides):
         "updated": parse_time(task.get("updated_at")),
         "created": parse_time(task.get("created_at")),
         "in_flight": state in IN_FLIGHT,
-        "id": (task.get("external_id") or "")[:10],
+        "task_id": (task.get("external_id") or "")[:8],
         "stop": stop_reason(task),
         "region": regions_of(task),
-        "upload": upload_of(task),
+        "batch_id": batch_id_of(task),
+        "batch": batch_id_of(task),
         "slow": slow_side(task, sides),
     }
 
@@ -500,16 +476,16 @@ def write_unsuccessful(tasks):
         lines.append("None right now.")
     else:
         lines += [
-            "| KIND | STATE | REGION | UPLOAD | CREATED | UPDATED | STOP | REASON |",
+            "| KIND | STATE | REGION | BATCH ID | CREATED | UPDATED | STOP | REASON |",
             "| --- | --- | --- | --- | --- | --- | --- | --- |",
         ]
         for task in sorted(bad, key=lambda item: item.get("updated_at") or "", reverse=True):
             lines.append(
-                "| {kind} | {state} | {region} | {upload} | {created} | {updated} | {stop} | {reason} |".format(
+                "| {kind} | {state} | {region} | {batch_id} | {created} | {updated} | {stop} | {reason} |".format(
                     kind=kind_of(task),
                     state=task.get("state") or "-",
                     region=regions_of(task),
-                    upload=upload_of(task),
+                    batch_id=batch_id_of(task),
                     created=local_clock(parse_time(task.get("created_at"))),
                     updated=local_clock(parse_time(task.get("updated_at"))),
                     stop=stop_reason(task) or "—",
@@ -552,24 +528,44 @@ def print_rows(rows):
     if not rows:
         print("  (none)")
         return
+
     print(
-        f"  {'KIND':<32} {'STATE':<10} {'SIZE':>10} {'TIME':>8} {'RATE':>10}  "
-        f"{'TIME STARTED':>12}  {'REGION':<14} {'UPLOAD':<10} {'STOP':<18} {'SLOW'}"
+        f"  {'TASK ID':<12} {'KIND':<32} {'STATE':<10} "
+        f"{'SIZE':>10} {'TIME':>8} {'RATE':>10}  "
+        f"{'TIME STARTED':>12}  {'REGION':<14} "
+        f"{'STOP':<18} {'SLOW'}"
     )
-    print("  " + "-" * 146)
+    print("  " + "-" * 145)
+
+    batches = defaultdict(list)
     for row in rows:
-        line = (
-            f"  {row['kind']:<32} {row['state']:<10} {fmt_mib(row['bytes']):>10} "
-            f"{fmt_secs(row['seconds']):>8} {fmt_rate(row['mib_s']):>10}  "
-            f"{local_clock(row.get('started')):>12}  "
-            f"{(row.get('region') or '—'):<14} {(row.get('upload') or '—'):<10} "
-            f"{(row.get('stop') or '—'):<18} {row.get('slow') or '—'}"
-        )
-        if row["state"] == "completed":
-            line = complete(line)
-        elif not row["in_flight"]:
-            line = emphasize(line)
-        print(line)
+        batches[row.get("batch_id") or "—"].append(row)
+
+    for batch_id, batch_rows in batches.items():
+        print()
+        print(f"BATCH ID  {batch_id}")
+        # print()
+
+        for row in batch_rows:
+            line = (
+                f"  {(row.get('task_id') or '—'):<12} "
+                f"{row['kind']:<32} "
+                f"{row['state']:<10} "
+                f"{fmt_mib(row['bytes']):>10} "
+                f"{fmt_secs(row['seconds']):>8} "
+                f"{fmt_rate(row['mib_s']):>10}  "
+                f"{local_clock(row.get('started')):>12}  "
+                f"{(row.get('region') or '—'):<14} "
+                f"{(row.get('stop') or '—'):<18} "
+                f"{row.get('slow') or '—'}"
+            )
+
+            if row["state"] == "completed":
+                line = complete(line)
+            elif not row["in_flight"]:
+                line = emphasize(line)
+
+            print(line)
 
 def from_time(rows, since):
     chosen = []
