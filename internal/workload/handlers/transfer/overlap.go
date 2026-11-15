@@ -326,7 +326,7 @@ type putOutcome struct {
 // transferOverlapped uploads a part while its download is still arriving.
 // The download slot is released when the read finishes, including when the
 // upload is still sending the last bytes. The caller holds that slot.
-func (h *Handler) transferOverlapped(ctx context.Context, part contracts.TransferPart) (partResult, error) {
+func (h *Handler) transferOverlapped(ctx context.Context, part contracts.TransferPart, lease *transferSlotLease) (partResult, error) {
 	readCtx, readCancel := context.WithCancel(ctx)
 	defer readCancel()
 	pub := make(chan *followBuffer, 1)
@@ -351,7 +351,11 @@ func (h *Handler) transferOverlapped(ctx context.Context, part contracts.Transfe
 	release := true
 	defer func() {
 		if release {
-			h.releaseSlot()
+			if lease != nil {
+				lease.release()
+			} else {
+				h.releaseSlot()
+			}
 		}
 	}()
 
@@ -432,7 +436,11 @@ func (h *Handler) transferOverlapped(ctx context.Context, part contracts.Transfe
 			done = nil
 			getDone = true
 			getBody = g.body
-			h.releaseSlot()
+			if lease != nil {
+				lease.release()
+			} else {
+				h.releaseSlot()
+			}
 			release = false
 			if g.err != nil {
 				if cur != nil {

@@ -77,6 +77,8 @@ type Handler struct {
 	uploads chan struct{}
 	// gate releases that limit while a PUT is waiting on its download.
 	gate *uploadGate
+	// slotGate manages download concurrency with reserve socket connections for incoming batches.
+	slotGate *transferGate
 }
 
 func NewHandler(client *http.Client) *Handler {
@@ -87,10 +89,38 @@ func NewHandler(client *http.Client) *Handler {
 	h := &Handler{client: client, wait: sleepContext, logf: log.Printf, slots: transferSlots(), uploads: uploadSlots()}
 	h.gate = newUploadGate(h.uploads, putOpenSlots())
 	h.gate.h = h
+	h.slotGate = newTransferGate(h, transferConcurrency(), transferReservedSlots())
 	return h
 }
 
-func transferSlots() chan struct{} {
+func transferReservedSlots() int {
+	n := transferReserveSlots
+	if raw := os.Getenv("BEAM_WORKER_TRANSFER_RESERVE"); raw != "" {
+		if raw == "0" || raw == "off" || raw == "false" {
+			return 0
+		}
+		if parsed, err := strconv.Atoi(raw); err == nil && parsed >= 0 {
+			return parsed
+		}
+	} else if raw := os.Getenv("BEAM_WORKER_RESERVED_SLOTS"); raw != "" {
+		if raw == "0" || raw == "off" || raw == "false" {
+			return 0
+		}
+		if parsed, err := strconv.Atoi(raw); err == nil && parsed >= 0 {
+			return parsed
+		}
+	} else if raw := os.Getenv("BEAM_WORKER_BATCH_RESERVE"); raw != "" {
+		if raw == "0" || raw == "off" || raw == "false" {
+			return 0
+		}
+		if parsed, err := strconv.Atoi(raw); err == nil && parsed >= 0 {
+			return parsed
+		}
+	}
+	return n
+}
+
+func transferConcurrency() int {
 	n := defaultTransferSlots
 	if raw := os.Getenv("BEAM_WORKER_TRANSFER_CONCURRENCY"); raw != "" {
 		parsed, err := strconv.Atoi(raw)
@@ -101,29 +131,52 @@ func transferSlots() chan struct{} {
 	if n == 0 {
 		n = defaultTransferSlots
 	}
+	return n
+}
+
+func transferSlots() chan struct{} {
+	n := transferConcurrency()
 	if n < 0 {
 		return nil
 	}
 	return make(chan struct{}, n)
 }
 
-func (h *Handler) acquireSlot(ctx context.Context) error {
-	if h.slots == nil {
-		return nil
+func (h *Handler) ensureSlotGate() *transferGate {
+	if h.slotGate != nil {
+		return h.slotGate
 	}
-	select {
-	case h.slots <- struct{}{}:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
+	concurrency := defaultTransferSlots
+	if h.slots != nil {
+		concurrency = cap(h.slots)
+	} else if raw := os.Getenv("BEAM_WORKER_TRANSFER_CONCURRENCY"); raw != "" {
+		if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 {
+			concurrency = parsed
+		}
 	}
+	h.slotGate = newTransferGate(h, concurrency, transferReservedSlots())
+	return h.slotGate
+}
+
+func (h *Handler) acquireSlot(ctx context.Context) (*transferSlotLease, error) {
+	if h == nil {
+		return nil, nil
+	}
+	gate := h.ensureSlotGate()
+	if gate == nil {
+		return nil, nil
+	}
+	return gate.acquire(ctx)
 }
 
 func (h *Handler) releaseSlot() {
-	if h.slots == nil {
+	if h == nil || h.slots == nil {
 		return
 	}
-	<-h.slots
+	select {
+	case <-h.slots:
+	default:
+	}
 }
 
 func uploadSlots() chan struct{} {
@@ -241,6 +294,7 @@ func (h *Handler) Execute(ctx context.Context, spec domain.Spec) (domain.Result,
 	}
 	trace := &transferLog{workload: spec.WorkloadID, attempt: spec.AttemptID, batch: spec.BatchID, started: time.Now(), printf: h.logf}
 	ctx = withTrace(ctx, trace)
+	ctx = withBatch(ctx, spec.BatchID)
 	trace.admitted(len(transfer.Parts))
 	h.warmHosts(ctx, transfer.Parts)
 	leader := true
@@ -364,13 +418,14 @@ func (r partResult) record(outputs map[string]string, prefix string, part contra
 }
 
 func (h *Handler) executePart(ctx context.Context, part contracts.TransferPart) (partResult, error) {
-	if err := h.acquireSlot(ctx); err != nil {
+	lease, err := h.acquireSlot(ctx)
+	if err != nil {
 		return partResult{}, err
 	}
+	defer lease.release()
 	enterTransfer()
 	defer leaveTransfer()
 	if part.Authenticated() {
-		defer h.releaseSlot()
 		return h.executeAuthenticatedPart(ctx, part)
 	}
 	if part.Length > 0 && part.Length <= maxResumablePart {
@@ -379,16 +434,15 @@ func (h *Handler) executePart(ctx context.Context, part contracts.TransferPart) 
 		// A part whose hash must be checked before the first uploaded byte stays
 		// serial. Everything else can upload once the read is fast enough to keep.
 		if part.ExpectedSHA256 == "" {
-			return h.transferOverlapped(ctx, part)
+			return h.transferOverlapped(ctx, part, lease)
 		}
 		body, err := h.readSource(ctx, part)
-		h.releaseSlot()
+		lease.release()
 		if err != nil {
 			return partResult{bytes: int64(len(body))}, err
 		}
 		return h.putPresigned(ctx, part, body)
 	}
-	defer h.releaseSlot()
 	return h.retryPresigned(ctx, func() (partResult, error) {
 		return h.executePresignedPart(ctx, part)
 	})

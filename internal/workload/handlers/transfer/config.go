@@ -58,6 +58,9 @@ var (
 	// putETagStrict fails an upload whose R2 part ETag is not the MD5 of the
 	// bytes sent. Off logs the mismatch and still accepts the 200.
 	putETagStrict = false
+	// transferReserveSlots is how many socket connections are reserved for
+	// different incoming batches. The FCFS slots are BEAM_WORKER_TRANSFER_CONCURRENCY - transferReserveSlots.
+	transferReserveSlots = 2
 )
 
 func init() {
@@ -101,6 +104,25 @@ func init() {
 			uploadPriorityAge = parsed
 		} else if secs, err := strconv.Atoi(raw); err == nil && secs >= 0 {
 			uploadPriorityAge = time.Duration(secs) * time.Second
+		}
+	}
+	if raw := os.Getenv("BEAM_WORKER_TRANSFER_RESERVE"); raw != "" {
+		if raw == "0" || raw == "off" || raw == "false" {
+			transferReserveSlots = 0
+		} else if parsed, err := strconv.Atoi(raw); err == nil && parsed >= 0 {
+			transferReserveSlots = parsed
+		}
+	} else if raw := os.Getenv("BEAM_WORKER_RESERVED_SLOTS"); raw != "" {
+		if raw == "0" || raw == "off" || raw == "false" {
+			transferReserveSlots = 0
+		} else if parsed, err := strconv.Atoi(raw); err == nil && parsed >= 0 {
+			transferReserveSlots = parsed
+		}
+	} else if raw := os.Getenv("BEAM_WORKER_BATCH_RESERVE"); raw != "" {
+		if raw == "0" || raw == "off" || raw == "false" {
+			transferReserveSlots = 0
+		} else if parsed, err := strconv.Atoi(raw); err == nil && parsed >= 0 {
+			transferReserveSlots = parsed
 		}
 	}
 	if raw := os.Getenv("BEAM_WORKER_PUT_MAX_DISCARDS"); raw != "" {
