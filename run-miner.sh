@@ -230,6 +230,10 @@ build() {
     fi
   fi
   go build -trimpath -ldflags "${ldflags}" -o "$WORKER_BIN" ./cmd/beam-worker
+  if [ -n "$rev" ]; then
+    cp -f "$WORKER_BIN" "${WORKER_BIN}-${rev}"
+    log "backed up worker binary to ${WORKER_BIN}-${rev}"
+  fi
 }
 
 tmux_running() {
