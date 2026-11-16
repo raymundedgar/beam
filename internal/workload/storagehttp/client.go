@@ -32,7 +32,7 @@ func NewClient(timeout time.Duration) *http.Client {
 
 func newClient(timeout time.Duration, allowed func(netip.AddrPort) bool) *http.Client {
 	dialer := &net.Dialer{
-		Timeout:   30 * time.Second,
+		Timeout:   5 * time.Second,
 		KeepAlive: 30 * time.Second,
 		Control: func(_, address string, _ syscall.RawConn) error {
 			target, err := netip.ParseAddrPort(address)
