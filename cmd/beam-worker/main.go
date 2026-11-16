@@ -79,7 +79,7 @@ func serve(arguments []string) {
 	bandwidth := flags.Int64("bandwidth-mbps", envInt64OrDefault("BEAM_WORKER_BANDWIDTH_MBPS", 10_000), "reservable bandwidth")
 	cpuMillis := flags.Int64("cpu-millis", envInt64OrDefault("BEAM_WORKER_CPU_MILLIS", 8_000), "reservable CPU millicores")
 	connections := flags.Int64("connections", envInt64OrDefault("BEAM_WORKER_CONNECTIONS", 4096), "reservable connections and streams")
-	capabilityList := flags.String("capabilities", "transfer.multipart,transfer.multipart.fanout.v1,transfer.authenticated_part.v1,transfer.source_digest.v1,room.transfer,room.transfer.direct.v1,room.transfer.e2ee.v2,storage.probe.relay.v2", "comma-separated enabled capabilities")
+	capabilityList := flags.String("capabilities", "transfer.multipart,transfer.multipart.fanout.v1,transfer.authenticated_part.v1,transfer.source_digest.v1,room.transfer,room.transfer.direct.v1,room.transfer.e2ee.v2,room.transfer.lease_renewal.v1,storage.probe.relay.v2", "comma-separated enabled capabilities")
 	statePath := flags.String("state", "data/worker/workloads.json", "durable workload journal")
 	actionRoot := flags.String("action-root", os.Getenv("BEAM_ACTION_ROOT"), "root of checksum-pinned Studio actions")
 	actionCache := flags.String("action-cache", "data/worker/action-cache", "content-addressed Studio action cache")
