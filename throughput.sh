@@ -3,7 +3,7 @@
 #
 #   ./throughput.sh          last wave
 #   ./throughput.sh watch    refresh every 2s; stake is read at most every 5 minutes
-#   ./throughput.sh all      every local task
+#   ./throughput.sh all      every local task from the past 24 hours
 #   ./throughput.sh 4:40PM   every task from 4:40 PM local time onward
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -575,16 +575,103 @@ def from_time(rows, since):
             chosen.append(row)
     return chosen
 
+def pct(sorted_vals, q):
+    if not sorted_vals:
+        return None
+    if len(sorted_vals) == 1:
+        return sorted_vals[0]
+    pos = (len(sorted_vals) - 1) * (q / 100.0)
+    lo = int(pos)
+    hi = min(lo + 1, len(sorted_vals) - 1)
+    frac = pos - lo
+    return sorted_vals[lo] * (1.0 - frac) + sorted_vals[hi] * frac
+
+def summarize_group(rows):
+    states = defaultdict(int)
+    total = 0
+    completed_bytes = 0
+    completed_secs = 0.0
+    rates = []
+    durations = []
+    ends = []
+    for row in rows:
+        states[row["state"]] += 1
+        total += row["bytes"] or 0
+        if row["state"] == "completed" and row["seconds"]:
+            completed_secs += row["seconds"]
+            completed_bytes += row["bytes"] or 0
+            durations.append(row["seconds"])
+            if row["mib_s"]:
+                rates.append(row["mib_s"])
+        if row.get("updated"):
+            ends.append(row["updated"])
+    rates.sort()
+    durations.sort()
+    avg = (completed_bytes / MIB / completed_secs) if completed_secs else None
+    rate_stats = {
+        "median": pct(rates, 50),
+        "mean": (sum(rates) / len(rates)) if rates else None,
+        "avg": avg,
+        "p90": pct(rates, 90),
+        "p95": pct(rates, 95),
+        "p99": pct(rates, 99),
+        "max": rates[-1] if rates else None,
+    }
+    time_stats = {
+        "median": pct(durations, 50),
+        "mean": (sum(durations) / len(durations)) if durations else None,
+        "p90": pct(durations, 90),
+        "p95": pct(durations, 95),
+        "p99": pct(durations, 99),
+        "max": durations[-1] if durations else None,
+    }
+    counts = "   ".join(
+        f"{name} {states[name]}"
+        for name in ("completed", "cancelled", "failed", "rejected", "running")
+        if states.get(name)
+    )
+    inflight = sum(1 for row in rows if row["in_flight"])
+    if inflight:
+        counts = (counts + "   " if counts else "") + f"in flight {inflight}"
+    return total, counts, rate_stats, time_stats, ends
+
+def print_stats_lines(indent, counts, rate_stats, time_stats):
+    if counts:
+        print(f"{indent}{counts}")
+    print(
+        f"{indent}rate   median {fmt_rate(rate_stats['median'])}   "
+        f"mean {fmt_rate(rate_stats['mean'])}   "
+        f"avg {fmt_rate(rate_stats['avg'])}   "
+        f"p90 {fmt_rate(rate_stats['p90'])}   "
+        f"p95 {fmt_rate(rate_stats['p95'])}   "
+        f"p99 {fmt_rate(rate_stats['p99'])}   "
+        f"max {fmt_rate(rate_stats['max'])}"
+    )
+    print(
+        f"{indent}time   median {fmt_secs(time_stats['median'])}   "
+        f"mean {fmt_secs(time_stats['mean'])}   "
+        f"p90 {fmt_secs(time_stats['p90'])}   "
+        f"p95 {fmt_secs(time_stats['p95'])}   "
+        f"p99 {fmt_secs(time_stats['p99'])}   "
+        f"max {fmt_secs(time_stats['max'])}"
+    )
+
 def print_since(rows, since):
     chosen = from_time(rows, since)
     chosen.sort(key=lambda row: row["updated"] or row["created"] or datetime.fromtimestamp(0, tz=timezone.utc), reverse=True)
-    states = defaultdict(int)
-    for row in chosen:
-        states[row["state"]] += 1
-    counts = "   ".join(f"{name} {states[name]}" for name in ("completed", "cancelled", "failed", "rejected", "running") if states.get(name))
-    print(f"\nFROM   {local_clock(since)}   {len(chosen)} tasks")
-    if counts:
-        print(f"       {counts}")
+    total, counts, rate_stats, time_stats, _ = summarize_group(chosen)
+    print(f"\nFROM   {local_clock(since)}   {len(chosen)} tasks   {fmt_mib(total)}")
+    print_stats_lines("       ", counts, rate_stats, time_stats)
+    print()
+    print_rows(chosen)
+    return chosen
+
+def print_all_24h(rows, since):
+    chosen = from_time(rows, since)
+    chosen.sort(key=lambda row: row["updated"] or row["created"] or datetime.fromtimestamp(0, tz=timezone.utc), reverse=True)
+    total, counts, rate_stats, time_stats, _ = summarize_group(chosen)
+    print(f"\nALL TASKS (24H)   from {local_clock(since)}   {len(chosen)} tasks   {fmt_mib(total)}")
+    print_stats_lines("                  ", counts, rate_stats, time_stats)
     print()
     print_rows(chosen)
     return chosen
@@ -596,38 +683,10 @@ def print_wave(rows):
         print("\nWAVE   (none)")
         return []
     started = min(row["created"] for row in wave if row.get("created"))
-    states = defaultdict(int)
-    total = 0
-    completed_bytes = 0
-    completed_secs = 0.0
-    rates = []
-    ends = []
-    for row in wave:
-        states[row["state"]] += 1
-        total += row["bytes"] or 0
-        if row["state"] == "completed" and row["seconds"]:
-            completed_secs += row["seconds"]
-            completed_bytes += row["bytes"] or 0
-            if row["mib_s"]:
-                rates.append(row["mib_s"])
-        if row.get("updated"):
-            ends.append(row["updated"])
-    rates.sort()
-    median = rates[len(rates) // 2] if rates else None
-    avg = (completed_bytes / MIB / completed_secs) if completed_secs else None
+    total, counts, rate_stats, time_stats, ends = summarize_group(wave)
     span = (max(ends) - started).total_seconds() if ends and started else None
-    counts = "   ".join(
-        f"{name} {states[name]}"
-        for name in ("completed", "cancelled", "failed", "rejected", "running")
-        if states.get(name)
-    )
-    inflight = sum(1 for row in wave if row["in_flight"])
-    if inflight:
-        counts = (counts + "   " if counts else "") + f"in flight {inflight}"
     print(f"\nWAVE   {local_clock(started)}   {len(wave)} tasks   {fmt_mib(total)}   span {fmt_secs(span)}")
-    if counts:
-        print(f"       {counts}")
-    print(f"       completed median {fmt_rate(median)}   avg {fmt_rate(avg)}")
+    print_stats_lines("       ", counts, rate_stats, time_stats)
     print()
     print_rows(wave)
     return wave
@@ -743,21 +802,21 @@ def print_emission(row):
 def render(show_all):
     tasks = fetch_tasks()
     write_unsuccessful(tasks)
-    sides = pace_sides(SINCE)
+    cutoff_24h = datetime.now(TZ) - timedelta(hours=24) if show_all else None
+    sides = pace_sides(SINCE or cutoff_24h)
     prelim = [enrich(task, {}, sides) for task in tasks]
     medians = medians_of(prelim)
     rows = [enrich(task, medians, sides) for task in tasks]
     rows.sort(key=lambda row: row["updated"] or datetime.fromtimestamp(0, tz=timezone.utc), reverse=True)
 
     print_emission(emission())
-    if SINCE is not None:
+    if show_all:
+        shown = print_all_24h(rows, cutoff_24h)
+    elif SINCE is not None:
         shown = print_since(rows, SINCE)
     else:
         shown = print_wave(rows)
     print_stop_legend(shown)
-    if show_all:
-        print(f"\nALL TASKS  {len(rows)}")
-        print_rows(rows)
     print()
 
 def main():
