@@ -38,7 +38,7 @@ const maxResumablePart = 64 << 20
 
 // presignedAttempts is the number of tries for one presigned part, for both the
 // download and the upload. HTTP 408, 429, and 5xx stop after this many tries.
-// BEAM_WORKER_HTTP_ATTEMPTS overrides it. A stall is not counted here.
+// BEAM_WORKER_BOTH_HTTP_ATTEMPTS overrides it. A stall is not counted here.
 var presignedAttempts = 3
 
 type multipartCheckpoint struct {
@@ -95,7 +95,7 @@ func NewHandler(client *http.Client) *Handler {
 
 func transferReservedSlots() int {
 	n := transferReserveSlots
-	if raw := os.Getenv("BEAM_WORKER_TRANSFER_RESERVE"); raw != "" {
+	if raw := os.Getenv("BEAM_WORKER_DL_RESERVE"); raw != "" {
 		if raw == "0" || raw == "off" || raw == "false" {
 			return 0
 		}
@@ -122,7 +122,7 @@ func transferReservedSlots() int {
 
 func transferConcurrency() int {
 	n := defaultTransferSlots
-	if raw := os.Getenv("BEAM_WORKER_TRANSFER_CONCURRENCY"); raw != "" {
+	if raw := os.Getenv("BEAM_WORKER_DL_CONCURRENCY"); raw != "" {
 		parsed, err := strconv.Atoi(raw)
 		if err == nil {
 			n = parsed
@@ -149,7 +149,7 @@ func (h *Handler) ensureSlotGate() *transferGate {
 	concurrency := defaultTransferSlots
 	if h.slots != nil {
 		concurrency = cap(h.slots)
-	} else if raw := os.Getenv("BEAM_WORKER_TRANSFER_CONCURRENCY"); raw != "" {
+	} else if raw := os.Getenv("BEAM_WORKER_DL_CONCURRENCY"); raw != "" {
 		if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 {
 			concurrency = parsed
 		}
@@ -181,7 +181,7 @@ func (h *Handler) releaseSlot() {
 
 func uploadSlots() chan struct{} {
 	n := defaultUploadSlots
-	if raw := os.Getenv("BEAM_WORKER_UPLOAD_CONCURRENCY"); raw != "" {
+	if raw := os.Getenv("BEAM_WORKER_UL_CONCURRENCY"); raw != "" {
 		parsed, err := strconv.Atoi(raw)
 		if err == nil {
 			n = parsed
@@ -206,7 +206,7 @@ func putOpenSlots() chan struct{} {
 		if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 {
 			n = parsed
 		}
-	} else if raw := os.Getenv("BEAM_WORKER_TRANSFER_CONCURRENCY"); raw != "" {
+	} else if raw := os.Getenv("BEAM_WORKER_DL_CONCURRENCY"); raw != "" {
 		if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 {
 			n = parsed
 		}

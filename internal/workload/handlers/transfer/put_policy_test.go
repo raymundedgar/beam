@@ -356,17 +356,17 @@ func TestRetryCapsRejectBlankAndNonsense(t *testing.T) {
 	t.Cleanup(func() {
 		maxSourceReplacements, presignedAttempts = probe, httpTries
 	})
-	t.Setenv("BEAM_WORKER_READ_PROBE_REPLACEMENTS", "nope")
-	t.Setenv("BEAM_WORKER_HTTP_ATTEMPTS", "0")
-	envNonNegative("BEAM_WORKER_READ_PROBE_REPLACEMENTS", &maxSourceReplacements)
-	envAtLeastOne("BEAM_WORKER_HTTP_ATTEMPTS", &presignedAttempts)
+	t.Setenv("BEAM_WORKER_DL_PROBE_REPLACEMENTS", "nope")
+	t.Setenv("BEAM_WORKER_BOTH_HTTP_ATTEMPTS", "0")
+	envNonNegative("BEAM_WORKER_DL_PROBE_REPLACEMENTS", &maxSourceReplacements)
+	envAtLeastOne("BEAM_WORKER_BOTH_HTTP_ATTEMPTS", &presignedAttempts)
 	if maxSourceReplacements != probe || presignedAttempts != httpTries {
 		t.Fatalf("caps changed probe=%d http=%d", maxSourceReplacements, presignedAttempts)
 	}
-	t.Setenv("BEAM_WORKER_READ_PROBE_REPLACEMENTS", "4")
-	t.Setenv("BEAM_WORKER_HTTP_ATTEMPTS", "2")
-	envNonNegative("BEAM_WORKER_READ_PROBE_REPLACEMENTS", &maxSourceReplacements)
-	envAtLeastOne("BEAM_WORKER_HTTP_ATTEMPTS", &presignedAttempts)
+	t.Setenv("BEAM_WORKER_DL_PROBE_REPLACEMENTS", "4")
+	t.Setenv("BEAM_WORKER_BOTH_HTTP_ATTEMPTS", "2")
+	envNonNegative("BEAM_WORKER_DL_PROBE_REPLACEMENTS", &maxSourceReplacements)
+	envAtLeastOne("BEAM_WORKER_BOTH_HTTP_ATTEMPTS", &presignedAttempts)
 	if maxSourceReplacements != 4 || presignedAttempts != 2 {
 		t.Fatalf("caps = probe %d http %d", maxSourceReplacements, presignedAttempts)
 	}

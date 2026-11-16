@@ -173,7 +173,7 @@ const tinyPeerWindow = 16 << 10
 
 // putHoldCap is how long a non-tail upload waits on a closed peer window
 // before it is discarded. The tail always uses putHoldTailCap. Set with
-// BEAM_WORKER_PUT_HOLD_MAX. putHoldDiscardMax is separate from the slow-ack
+// BEAM_WORKER_UL_HOLD_MAX. putHoldDiscardMax is separate from the slow-ack
 // discard cap.
 var putHoldCap = 25 * time.Second
 

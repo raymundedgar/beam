@@ -50,7 +50,7 @@ var (
 	readMedianFactor = 1.5
 	// readKeepMinRate is the download rate, in bytes per second, that is left
 	// alone. A 48 MiB part at 5 MiB/s finishes the read in about 10 seconds.
-	// Slower sockets are still replaced. BEAM_WORKER_READ_KEEP_RATE is MiB/s.
+	// Slower sockets are still replaced. BEAM_WORKER_DL_KEEP_RATE is MiB/s.
 	readKeepMinRate int64 = 5 << 20
 	// readResetNoETag resets the upload when a 206 drops and the response had
 	// no ETag. A matching ETag keeps the prefix either way.
@@ -59,7 +59,7 @@ var (
 	// bytes sent. Off logs the mismatch and still accepts the 200.
 	putETagStrict = false
 	// transferReserveSlots is how many socket connections are reserved for
-	// different incoming batches. The FCFS slots are BEAM_WORKER_TRANSFER_CONCURRENCY - transferReserveSlots.
+	// different incoming batches. The FCFS slots are BEAM_WORKER_DL_CONCURRENCY - transferReserveSlots.
 	transferReserveSlots = 2
 )
 
@@ -74,19 +74,19 @@ func init() {
 	readMedian = envBool("BEAM_WORKER_READ_MEDIAN", true)
 	readResetNoETag = envBool("BEAM_WORKER_READ_RESET_NO_ETAG", true)
 	putETagStrict = envBool("BEAM_WORKER_PUT_ETAG_STRICT", false)
-	envNonNegative("BEAM_WORKER_READ_PROBE_REPLACEMENTS", &maxSourceReplacements)
-	envAtLeastOne("BEAM_WORKER_HTTP_ATTEMPTS", &presignedAttempts)
-	if raw := os.Getenv("BEAM_WORKER_READ_KEEP_RATE"); raw != "" {
+	envNonNegative("BEAM_WORKER_DL_PROBE_REPLACEMENTS", &maxSourceReplacements)
+	envAtLeastOne("BEAM_WORKER_BOTH_HTTP_ATTEMPTS", &presignedAttempts)
+	if raw := os.Getenv("BEAM_WORKER_DL_KEEP_RATE"); raw != "" {
 		if parsed, err := strconv.ParseFloat(raw, 64); err == nil && parsed >= 0 {
 			readKeepMinRate = int64(parsed * (1 << 20))
 		}
 	}
-	if raw := os.Getenv("BEAM_WORKER_READ_RESTARTS"); raw != "" {
+	if raw := os.Getenv("BEAM_WORKER_DL_RESTARTS"); raw != "" {
 		if parsed, err := strconv.Atoi(raw); err == nil && parsed >= 0 {
 			readRestartCap = parsed
 		}
 	}
-	if raw := os.Getenv("BEAM_WORKER_PUT_HOLD_MAX"); raw != "" {
+	if raw := os.Getenv("BEAM_WORKER_UL_HOLD_MAX"); raw != "" {
 		switch raw {
 		case "0", "off":
 			putHoldCap = 0
@@ -98,15 +98,15 @@ func init() {
 			}
 		}
 	}
-	uploadPriority = envBool("BEAM_WORKER_UPLOAD_PRIORITY", false)
-	if raw := os.Getenv("BEAM_WORKER_UPLOAD_PRIORITY_AGE"); raw != "" {
+	uploadPriority = envBool("BEAM_WORKER_UL_PRIORITY", false)
+	if raw := os.Getenv("BEAM_WORKER_UL_PRIORITY_AGE"); raw != "" {
 		if parsed, err := time.ParseDuration(raw); err == nil && parsed >= 0 {
 			uploadPriorityAge = parsed
 		} else if secs, err := strconv.Atoi(raw); err == nil && secs >= 0 {
 			uploadPriorityAge = time.Duration(secs) * time.Second
 		}
 	}
-	if raw := os.Getenv("BEAM_WORKER_TRANSFER_RESERVE"); raw != "" {
+	if raw := os.Getenv("BEAM_WORKER_DL_RESERVE"); raw != "" {
 		if raw == "0" || raw == "off" || raw == "false" {
 			transferReserveSlots = 0
 		} else if parsed, err := strconv.Atoi(raw); err == nil && parsed >= 0 {
@@ -125,7 +125,7 @@ func init() {
 			transferReserveSlots = parsed
 		}
 	}
-	if raw := os.Getenv("BEAM_WORKER_PUT_MAX_DISCARDS"); raw != "" {
+	if raw := os.Getenv("BEAM_WORKER_UL_MAX_DISCARDS"); raw != "" {
 		if parsed, err := strconv.Atoi(raw); err == nil && parsed >= 0 {
 			putMaxDiscards = parsed
 		}

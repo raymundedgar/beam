@@ -408,8 +408,8 @@ func TestTransferReserveFullHandlerExecute(t *testing.T) {
 }
 
 func TestTransferReservedSlotsEnvVar(t *testing.T) {
-	t.Setenv("BEAM_WORKER_TRANSFER_CONCURRENCY", "6")
-	t.Setenv("BEAM_WORKER_TRANSFER_RESERVE", "3")
+	t.Setenv("BEAM_WORKER_DL_CONCURRENCY", "6")
+	t.Setenv("BEAM_WORKER_DL_RESERVE", "3")
 
 	// Concurrency = 6, Reserved = 3 -> FCFS = 3, Reserved = 3
 	h := NewHandler(&http.Client{Transport: &http.Transport{MaxIdleConnsPerHost: 10}})

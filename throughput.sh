@@ -18,6 +18,8 @@ esac
 TOKEN=$(cat data/orchestrator/control-token)
 mkdir -p data/analytics
 
+clear 2>/dev/null || true
+
 python3 - "$MODE" "$TOKEN" "$SINCE" <<'PY'
 import hashlib, ipaddress, json, os, re, subprocess, sys, time, urllib.error, urllib.parse, urllib.request
 from collections import defaultdict
@@ -799,6 +801,12 @@ def print_emission(row):
     price_s = "" if price is None else f"   TAO ${float(price):,.2f}"
     print(f"EMISSION  sn105   {alpha_s} alpha   {float(row['tao']):.6f} TAO   {usd_s}{price_s}")
 
+def clear_terminal():
+    try:
+        subprocess.run(["clear"], check=False)
+    except Exception:
+        os.system("clear")
+
 def render(show_all):
     tasks = fetch_tasks()
     write_unsuccessful(tasks)
@@ -808,8 +816,10 @@ def render(show_all):
     medians = medians_of(prelim)
     rows = [enrich(task, medians, sides) for task in tasks]
     rows.sort(key=lambda row: row["updated"] or datetime.fromtimestamp(0, tz=timezone.utc), reverse=True)
+    stake = emission()
 
-    print_emission(emission())
+    clear_terminal()
+    print_emission(stake)
     if show_all:
         shown = print_all_24h(rows, cutoff_24h)
     elif SINCE is not None:
@@ -822,8 +832,6 @@ def render(show_all):
 def main():
     show_all = MODE == "all"
     while True:
-        if MODE == "watch":
-            sys.stdout.write("\033[2J\033[H")
         render(show_all)
         if MODE != "watch":
             return
