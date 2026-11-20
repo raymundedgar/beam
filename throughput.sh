@@ -128,6 +128,58 @@ def fmt_rate(mib_s):
         return "—"
     return f"{mib_s:.1f} MiB/s"
 
+def fmt_dl_ul(dl, ul):
+    if dl is None and ul is None:
+        return "—"
+    dl_s = f"{dl:.1f}" if dl is not None else "—"
+    ul_s = f"{ul:.1f}" if ul is not None else "—"
+    return f"{dl_s} / {ul_s}"
+
+def parse_dur_sec(s):
+    if not s or s == "-":
+        return 0.0
+    s = s.strip()
+    if s.endswith("ms"):
+        return float(s[:-2]) / 1000.0
+    if s.endswith("us"):
+        return float(s[:-2]) / 1000000.0
+    if s.endswith("s"):
+        return float(s[:-1])
+    try:
+        return float(s)
+    except (ValueError, TypeError):
+        return 0.0
+
+def fmt_sec_val(s):
+    if s is None or s < 0:
+        return "—"
+    return f"{s:.2f}s"
+
+def fmt_stall_val(s):
+    if s is None or s < 0.05:
+        return "—"
+    return f"{s:.1f}s"
+
+def fmt_rate_val(r):
+    if r is None:
+        return "—"
+    return f"{r:.1f}"
+
+def format_stop(state, stop, in_flight, starved=0.0):
+    starve_note = ""
+    if starved and starved >= 1.0:
+        starve_note = f"starved {starved:.1f}s"
+
+    if state == "completed":
+        return starve_note or "—"
+    state_s = (state or "—").upper()
+    if in_flight:
+        return state_s
+    stop_text = f"{state_s} - {stop}" if (stop and stop != "—") else state_s
+    if starve_note:
+        return f"{stop_text} ({starve_note})"
+    return stop_text
+
 def host_of(url):
     if not url or not isinstance(url, str):
         return None
@@ -283,6 +335,25 @@ def kind_of(task):
         return f"{base}/{src}"
     return f"{base}/{src}>{dst}"
 
+KIND_ABBR = {
+    "transfer.multipart": "TM",
+    "room.transfer": "RT",
+    "transfer.authenticated_part.v1": "AP",
+    "transfer.authenticated_part": "AP",
+    "transfer.source_digest.v1": "SD",
+    "storage.probe.relay.v2": "SP",
+    "storage.probe": "SP",
+}
+
+def kind_abbr(kind_str):
+    if not kind_str or kind_str == "-":
+        return "-"
+    if "/" in kind_str:
+        base, rest = kind_str.split("/", 1)
+        abbr = KIND_ABBR.get(base, base)
+        return f"{abbr}/{rest}"
+    return KIND_ABBR.get(kind_str, kind_str)
+
 def workload_ids(task):
     found = []
     for raw in (task.get("external_id"), task.get("workload_key")):
@@ -318,43 +389,114 @@ def parse_since(text):
 
 SINCE = parse_since(SINCE_TEXT) if MODE == "since" else None
 
-def pace_sides(since=None):
-    """Last transfer side seen for each workload, from the worker journal."""
+def pace_info(since=None):
+    """Last transfer rates, durations, stalls, and starvation seen for each workload, from the worker journal."""
     journal_since = "6 hours ago"
     if since is not None:
         journal_since = since.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
     try:
         proc = subprocess.run(
-            ["journalctl", "-u", "beam-worker", "--since", journal_since, "-o", "cat", "-g", "transfer pace"],
+            ["journalctl", "-u", "beam-worker", "--since", journal_since, "-o", "cat", "-g", "transfer (pace|read_frozen|report)"],
             capture_output=True, text=True, timeout=8,
         )
     except (OSError, subprocess.SubprocessError):
         return {}
     if proc.returncode != 0:
         return {}
-    sides = {}
+    info = {}
     for line in proc.stdout.splitlines():
-        workload = re.search(r"workload=([0-9a-f-]{8,})", line)
-        side = re.search(r"side=(source|destination)", line)
-        if not workload or not side:
-            continue
-        key = workload.group(1).lower()
-        sides[key] = "download" if side.group(1) == "source" else "upload"
-        sides[key[:8]] = sides[key]
-    return sides
+        if "transfer pace" in line:
+            workload = re.search(r"workload=([0-9a-f-]{8,})", line)
+            side = re.search(r"side=(source|destination)", line)
+            dur = re.search(r"dur=([0-9.]+(?:ms|s|us)?)", line)
+            blk = re.search(r"blocked=([0-9.]+(?:ms|s|us)?)", line)
+            rate = re.search(r"rate_mib=([0-9.]+)", line)
+            if not workload or not side:
+                continue
+            key = workload.group(1).lower()
+            if key not in info:
+                entry = {
+                    "dl_rate": None, "ul_rate": None,
+                    "dl_time": 0.0, "ul_time": 0.0,
+                    "dl_stall": 0.0, "ul_stall": 0.0,
+                    "starved": 0.0,
+                    "has_dl": False, "has_ul": False,
+                }
+                info[key] = entry
+                info[key[:8]] = entry
+            entry = info[key]
+            is_dl = side.group(1) == "source"
+            d_sec = parse_dur_sec(dur.group(1)) if dur else 0.0
+            b_sec = parse_dur_sec(blk.group(1)) if blk else 0.0
+            if is_dl:
+                entry["has_dl"] = True
+                entry["dl_time"] += d_sec
+                entry["dl_stall"] += b_sec
+                if rate:
+                    entry["dl_rate"] = float(rate.group(1))
+            else:
+                entry["has_ul"] = True
+                entry["ul_time"] += d_sec
+                entry["ul_stall"] += b_sec
+                if rate:
+                    entry["ul_rate"] = float(rate.group(1))
+        elif "transfer read_frozen" in line:
+            workload = re.search(r"workload=([0-9a-f-]{8,})", line)
+            idle = re.search(r"idle=([0-9.]+(?:ms|s|us)?)", line)
+            if workload and idle:
+                key = workload.group(1).lower()
+                if key not in info:
+                    entry = {
+                        "dl_rate": None, "ul_rate": None,
+                        "dl_time": 0.0, "ul_time": 0.0,
+                        "dl_stall": 0.0, "ul_stall": 0.0,
+                        "starved": 0.0,
+                        "has_dl": False, "has_ul": False,
+                    }
+                    info[key] = entry
+                    info[key[:8]] = entry
+                info[key]["dl_stall"] += parse_dur_sec(idle.group(1))
+        elif "transfer report" in line:
+            workload = re.search(r"workload=([0-9a-f-]{8,})", line)
+            starved = re.search(r"slot_starved=([0-9.]+(?:ms|s|us)?)", line)
+            slot_wait = re.search(r"slot_wait=([0-9.]+(?:ms|s|us)?)", line)
+            if workload:
+                key = workload.group(1).lower()
+                if key not in info:
+                    entry = {
+                        "dl_rate": None, "ul_rate": None,
+                        "dl_time": 0.0, "ul_time": 0.0,
+                        "dl_stall": 0.0, "ul_stall": 0.0,
+                        "starved": 0.0,
+                        "has_dl": False, "has_ul": False,
+                    }
+                    info[key] = entry
+                    info[key[:8]] = entry
+                total_starve = 0.0
+                if starved:
+                    total_starve += parse_dur_sec(starved.group(1))
+                if slot_wait:
+                    total_starve += parse_dur_sec(slot_wait.group(1))
+                info[key]["starved"] = total_starve
+    return info
 
-def slow_side(task, sides):
-    if (task.get("state") or "") != "cancelled":
-        return "—"
+def task_metrics(task, pace):
     for key in workload_ids(task):
-        if key in sides:
-            return sides[key]
-        if key[:8] in sides:
-            return sides[key[:8]]
-    return "—"
+        entry = pace.get(key) or pace.get(key[:8])
+        if entry:
+            dl_rate = entry.get("dl_rate")
+            ul_rate = entry.get("ul_rate")
+            dl_time = entry["dl_time"] if entry.get("has_dl") else None
+            ul_time = entry["ul_time"] if entry.get("has_ul") else None
+            dl_stall = entry["dl_stall"] if entry.get("has_dl") else None
+            ul_stall = entry["ul_stall"] if entry.get("has_ul") else None
+            starved = entry.get("starved", 0.0)
+            return dl_rate, ul_rate, dl_time, ul_time, dl_stall, ul_stall, starved
+    return None, None, None, None, None, None, 0.0
 
-def enrich(task, medians, sides):
-    kind = kind_of(task)
+def enrich(task, medians, pace):
+    raw_kind = kind_of(task)
+    kind = kind_abbr(raw_kind)
     state = task.get("state") or "-"
     nbytes = task_bytes(task)
     start, end = task_window(task)
@@ -364,12 +506,20 @@ def enrich(task, medians, sides):
     if state == "rejected":
         seconds = None
     mib_s = (nbytes / MIB / seconds) if nbytes and seconds and seconds > 0 else None
+    dl_mib_s, ul_mib_s, dl_time, ul_time, dl_stall, ul_stall, starved = task_metrics(task, pace)
     return {
         "kind": kind,
         "state": state,
         "bytes": nbytes,
         "seconds": seconds,
         "mib_s": mib_s,
+        "dl_mib_s": dl_mib_s,
+        "ul_mib_s": ul_mib_s,
+        "dl_time": dl_time,
+        "ul_time": ul_time,
+        "dl_stall": dl_stall,
+        "ul_stall": ul_stall,
+        "starved": starved,
         "started": start,
         "ended": None if state in IN_FLIGHT else end,
         "updated": parse_time(task.get("updated_at")),
@@ -380,7 +530,6 @@ def enrich(task, medians, sides):
         "region": regions_of(task),
         "batch_id": batch_id_of(task),
         "batch": batch_id_of(task),
-        "slow": slow_side(task, sides),
     }
 
 def medians_of(rows):
@@ -532,12 +681,13 @@ def print_rows(rows):
         return
 
     print(
-        f"  {'TASK ID':<12} {'KIND':<32} {'STATE':<10} "
-        f"{'SIZE':>10} {'TIME':>8} {'RATE':>10}  "
-        f"{'TIME STARTED':>12}  {'REGION':<14} "
-        f"{'STOP':<18} {'SLOW'}"
+        f"  {'TASK ID':<8}  {'KIND':<7}  "
+        f"{'TIME':>7}  {'DL TIME':>8}  {'UL TIME':>8}  "
+        f"{'DL STALL':>8}  {'UL STALL':>8}  "
+        f"{'RATE':>10}  {'DL RATE':>7}  {'UL RATE':>7}  "
+        f"{'STARTED':>11}  {'REGION':<10}  {'STOP'}"
     )
-    print("  " + "-" * 145)
+    print("  " + "-" * 127)
 
     batches = defaultdict(list)
     for row in rows:
@@ -546,20 +696,23 @@ def print_rows(rows):
     for batch_id, batch_rows in batches.items():
         print()
         print(f"BATCH ID  {batch_id}")
-        # print()
 
         for row in batch_rows:
+            stop_str = format_stop(row.get("state"), row.get("stop"), row.get("in_flight"), row.get("starved", 0.0))
             line = (
-                f"  {(row.get('task_id') or '—'):<12} "
-                f"{row['kind']:<32} "
-                f"{row['state']:<10} "
-                f"{fmt_mib(row['bytes']):>10} "
-                f"{fmt_secs(row['seconds']):>8} "
+                f"  {(row.get('task_id') or '—'):<8}  "
+                f"{row['kind']:<7}  "
+                f"{fmt_secs(row['seconds']):>7}  "
+                f"{fmt_sec_val(row.get('dl_time')):>8}  "
+                f"{fmt_sec_val(row.get('ul_time')):>8}  "
+                f"{fmt_stall_val(row.get('dl_stall')):>8}  "
+                f"{fmt_stall_val(row.get('ul_stall')):>8}  "
                 f"{fmt_rate(row['mib_s']):>10}  "
-                f"{local_clock(row.get('started')):>12}  "
-                f"{(row.get('region') or '—'):<14} "
-                f"{(row.get('stop') or '—'):<18} "
-                f"{row.get('slow') or '—'}"
+                f"{fmt_rate_val(row.get('dl_mib_s')):>7}  "
+                f"{fmt_rate_val(row.get('ul_mib_s')):>7}  "
+                f"{local_clock(row.get('started')):>11}  "
+                f"{(row.get('region') or '—'):<10}  "
+                f"{stop_str}"
             )
 
             if row["state"] == "completed":
@@ -595,6 +748,12 @@ def summarize_group(rows):
     completed_secs = 0.0
     rates = []
     durations = []
+    dl_rates = []
+    ul_rates = []
+    dl_times = []
+    ul_times = []
+    dl_stalls = []
+    ul_stalls = []
     ends = []
     for row in rows:
         states[row["state"]] += 1
@@ -605,10 +764,30 @@ def summarize_group(rows):
             durations.append(row["seconds"])
             if row["mib_s"]:
                 rates.append(row["mib_s"])
+            if row.get("dl_mib_s") is not None:
+                dl_rates.append(row["dl_mib_s"])
+            if row.get("ul_mib_s") is not None:
+                ul_rates.append(row["ul_mib_s"])
+            if row.get("dl_time") is not None:
+                dl_times.append(row["dl_time"])
+            if row.get("ul_time") is not None:
+                ul_times.append(row["ul_time"])
+            if row.get("dl_stall") is not None:
+                dl_stalls.append(row["dl_stall"])
+            if row.get("ul_stall") is not None:
+                ul_stalls.append(row["ul_stall"])
         if row.get("updated"):
             ends.append(row["updated"])
     rates.sort()
     durations.sort()
+    dl_rates.sort()
+    ul_rates.sort()
+    dl_times.sort()
+    ul_times.sort()
+    dl_stalls.sort()
+    ul_stalls.sort()
+    starved_vals = [row.get("starved", 0.0) for row in rows if row.get("starved", 0.0) >= 0.05]
+    starved_vals.sort()
     avg = (completed_bytes / MIB / completed_secs) if completed_secs else None
     rate_stats = {
         "median": pct(rates, 50),
@@ -618,6 +797,8 @@ def summarize_group(rows):
         "p95": pct(rates, 95),
         "p99": pct(rates, 99),
         "max": rates[-1] if rates else None,
+        "dl_median": pct(dl_rates, 50),
+        "ul_median": pct(ul_rates, 50),
     }
     time_stats = {
         "median": pct(durations, 50),
@@ -626,6 +807,12 @@ def summarize_group(rows):
         "p95": pct(durations, 95),
         "p99": pct(durations, 99),
         "max": durations[-1] if durations else None,
+        "dl_median": pct(dl_times, 50),
+        "ul_median": pct(ul_times, 50),
+        "dl_stall_median": pct(dl_stalls, 50),
+        "ul_stall_median": pct(ul_stalls, 50),
+        "starved_median": pct(starved_vals, 50),
+        "starved_max": starved_vals[-1] if starved_vals else None,
     }
     counts = "   ".join(
         f"{name} {states[name]}"
@@ -640,8 +827,13 @@ def summarize_group(rows):
 def print_stats_lines(indent, counts, rate_stats, time_stats):
     if counts:
         print(f"{indent}{counts}")
+    dl_ul_med = ""
+    if rate_stats.get("dl_median") is not None or rate_stats.get("ul_median") is not None:
+        dl_s = f"{rate_stats['dl_median']:.1f}" if rate_stats.get("dl_median") is not None else "—"
+        ul_s = f"{rate_stats['ul_median']:.1f}" if rate_stats.get("ul_median") is not None else "—"
+        dl_ul_med = f" (dl {dl_s} / ul {ul_s})"
     print(
-        f"{indent}rate   median {fmt_rate(rate_stats['median'])}   "
+        f"{indent}rate   median {fmt_rate(rate_stats['median'])}{dl_ul_med}   "
         f"mean {fmt_rate(rate_stats['mean'])}   "
         f"avg {fmt_rate(rate_stats['avg'])}   "
         f"p90 {fmt_rate(rate_stats['p90'])}   "
@@ -649,14 +841,33 @@ def print_stats_lines(indent, counts, rate_stats, time_stats):
         f"p99 {fmt_rate(rate_stats['p99'])}   "
         f"max {fmt_rate(rate_stats['max'])}"
     )
+    dl_ul_time_med = ""
+    if time_stats.get("dl_median") is not None or time_stats.get("ul_median") is not None:
+        dl_t = f"{time_stats['dl_median']:.2f}s" if time_stats.get("dl_median") is not None else "—"
+        ul_t = f"{time_stats['ul_median']:.2f}s" if time_stats.get("ul_median") is not None else "—"
+        dl_ul_time_med = f" (dl {dl_t} / ul {ul_t})"
     print(
-        f"{indent}time   median {fmt_secs(time_stats['median'])}   "
+        f"{indent}time   median {fmt_secs(time_stats['median'])}{dl_ul_time_med}   "
         f"mean {fmt_secs(time_stats['mean'])}   "
         f"p90 {fmt_secs(time_stats['p90'])}   "
         f"p95 {fmt_secs(time_stats['p95'])}   "
         f"p99 {fmt_secs(time_stats['p99'])}   "
         f"max {fmt_secs(time_stats['max'])}"
     )
+    stall_parts = []
+    if time_stats.get("dl_stall_median") is not None or time_stats.get("ul_stall_median") is not None:
+        dl_st = time_stats.get("dl_stall_median") or 0.0
+        ul_st = time_stats.get("ul_stall_median") or 0.0
+        dl_st_s = f"{dl_st:.2f}s" if dl_st >= 0.01 else "0s"
+        ul_st_s = f"{ul_st:.2f}s" if ul_st >= 0.01 else "0s"
+        stall_parts.append(f"median dl {dl_st_s} / ul {ul_st_s}")
+    if time_stats.get("starved_max") and time_stats["starved_max"] >= 0.5:
+        st_med = time_stats.get("starved_median") or 0.0
+        st_max = time_stats["starved_max"]
+        st_med_s = f"{st_med:.2f}s" if st_med >= 0.01 else "0s"
+        stall_parts.append(f"starved median {st_med_s} / max {st_max:.2f}s")
+    if stall_parts:
+        print(f"{indent}stall  {'   '.join(stall_parts)}")
 
 def print_since(rows, since):
     chosen = from_time(rows, since)
@@ -779,6 +990,14 @@ def emission():
     save_emission(cached)
     return cached
 
+def print_legend():
+    print("\nLEGEND")
+    print("  KIND    TM: transfer.multipart   RT: room.transfer   AP: authenticated_part   SP: storage.probe")
+    print("  RATES   RATE is total in MiB/s; DL RATE (source CDN) and UL RATE (destination storage) are in MiB/s")
+    print("  TIMES   TIME is total task duration; DL TIME and UL TIME are download and upload durations")
+    print("  STALLS  DL STALL is source freeze time; UL STALL is destination socket/TCP write stall time")
+    print("  STARVE  In STOP column, indicates task was concurrency/buffer starved for >= 1s")
+
 def print_stop_legend(rows):
     seen = {row.get("stop") for row in rows if row.get("stop")}
     lines = [(code, meaning) for code, meaning in STOP_REASONS if code in seen]
@@ -811,10 +1030,10 @@ def render(show_all):
     tasks = fetch_tasks()
     write_unsuccessful(tasks)
     cutoff_24h = datetime.now(TZ) - timedelta(hours=24) if show_all else None
-    sides = pace_sides(SINCE or cutoff_24h)
-    prelim = [enrich(task, {}, sides) for task in tasks]
+    pace = pace_info(SINCE or cutoff_24h)
+    prelim = [enrich(task, {}, pace) for task in tasks]
     medians = medians_of(prelim)
-    rows = [enrich(task, medians, sides) for task in tasks]
+    rows = [enrich(task, medians, pace) for task in tasks]
     rows.sort(key=lambda row: row["updated"] or datetime.fromtimestamp(0, tz=timezone.utc), reverse=True)
     stake = emission()
 
@@ -826,6 +1045,7 @@ def render(show_all):
         shown = print_since(rows, SINCE)
     else:
         shown = print_wave(rows)
+    print_legend()
     print_stop_legend(shown)
     print()
 

@@ -28,8 +28,8 @@ ROOM_TRANSFER_ADDR_DEFAULT='0.0.0.0:9470'
 ROOM_TRANSFER_URL_DEFAULT='http://198.58.113.189:9470'
 SUBSYSTEM_MODE_DEFAULT='integrated'
 
-log() { printf '[run-miner] %s\n' "$*"; }
-die() { printf '[run-miner] %s\n' "$*" >&2; exit 1; }
+log() { printf '[run-miner %s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S %Z')" "$*"; }
+die() { printf '[run-miner %s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S %Z')" "$*" >&2; exit 1; }
 
 runtime() {
   if [ "${BEAM_MINER_RUNTIME:-}" = tmux ]; then
@@ -213,7 +213,9 @@ PY
 
 build() {
   mkdir -p "$ROOT/bin"
-  log "building orchestrator"
+  local compile_start
+  compile_start="$(date '+%Y-%m-%d %H:%M:%S %Z')"
+  log "building orchestrator (started: ${compile_start})"
   go build -trimpath -o "$ORCH_BIN" ./cmd/beam-orchestrator
   log "building worker"
   local rev dirty ldflags
@@ -230,10 +232,15 @@ build() {
     fi
   fi
   go build -trimpath -ldflags "${ldflags}" -o "$WORKER_BIN" ./cmd/beam-worker
+  local compile_done
+  compile_done="$(date '+%Y-%m-%d %H:%M:%S %Z')"
   if [ -n "$rev" ]; then
+    cp -f "$ORCH_BIN" "${ORCH_BIN}-${rev}"
+    log "backed up orchestrator binary to ${ORCH_BIN}-${rev}"
     cp -f "$WORKER_BIN" "${WORKER_BIN}-${rev}"
     log "backed up worker binary to ${WORKER_BIN}-${rev}"
   fi
+  log "compiled beam-orchestrator and beam-worker at ${compile_done}"
 }
 
 tmux_running() {

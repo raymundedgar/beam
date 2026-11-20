@@ -2,7 +2,7 @@
 # Published BeamCore PRISM snapshot for this orchestrator.
 # Throughput and verified bandwidth are the same goodput figure.
 #
-#   ./scores.sh            normal run (makes at most one audit read)
+#   ./scores.sh            normal run (fetches immediately when using proxy or --force)
 #   ./scores.sh --force    ignore the saved rate-limit hold and the freshness
 #                          check for this run and ask BeamCore right now
 #
@@ -85,22 +85,56 @@ def audit_opener():
     return urllib.request.build_opener(*handlers), True
 
 OPENER, USING_PROXY = audit_opener()
+DIRECT_OPENER = urllib.request.build_opener()
 
-def get_json(url):
-    request = urllib.request.Request(url, headers=HEADERS)
-    try:
-        with OPENER.open(request, timeout=30) as response:
-            return json.loads(response.read().decode())
-    except urllib.error.HTTPError as err:
-        detail = err.read().decode(errors="replace")[:200]
-        raise ScoreError(
-            f"HTTP {err.code} ({detail.strip() or err.reason})",
-            status=err.code,
-            retry_after=parse_retry_after(err.headers.get("Retry-After")),
-        )
-    except (OSError, ValueError) as err:
-        # timeouts, DNS failures, dropped connections, bodies that are not JSON
-        raise ScoreError(f"request failed: {err}")
+def get_json(url, max_retries=3):
+    last_err = None
+    for attempt in range(max_retries):
+        request = urllib.request.Request(url, headers=HEADERS)
+        try:
+            with OPENER.open(request, timeout=20) as response:
+                return json.loads(response.read().decode())
+        except urllib.error.HTTPError as err:
+            if err.code == 429:
+                detail = err.read().decode(errors="replace")[:200]
+                raise ScoreError(
+                    f"HTTP {err.code} ({detail.strip() or err.reason})",
+                    status=err.code,
+                    retry_after=parse_retry_after(err.headers.get("Retry-After")),
+                )
+            if err.code in (502, 503, 504) and attempt + 1 < max_retries:
+                time.sleep(1.0 * (attempt + 1))
+                continue
+            detail = err.read().decode(errors="replace")[:200]
+            raise ScoreError(
+                f"HTTP {err.code} ({detail.strip() or err.reason})",
+                status=err.code,
+                retry_after=parse_retry_after(err.headers.get("Retry-After")),
+            )
+        except OSError as err:
+            last_err = err
+            if attempt + 1 < max_retries:
+                time.sleep(1.0 * (attempt + 1))
+                continue
+        except ValueError as err:
+            raise ScoreError(f"invalid JSON response: {err}")
+
+    if USING_PROXY:
+        try:
+            request = urllib.request.Request(url, headers=HEADERS)
+            with DIRECT_OPENER.open(request, timeout=20) as response:
+                return json.loads(response.read().decode())
+        except urllib.error.HTTPError as err:
+            detail = err.read().decode(errors="replace")[:200]
+            raise ScoreError(
+                f"HTTP {err.code} ({detail.strip() or err.reason})",
+                status=err.code,
+                retry_after=parse_retry_after(err.headers.get("Retry-After")),
+            )
+        except (OSError, ValueError) as err:
+            raise ScoreError(f"request failed: proxy ({last_err}), direct ({err})")
+
+    raise ScoreError(f"request failed: {last_err}")
 
 def clock(value):
     if not value:
@@ -196,14 +230,43 @@ def save_json(path, value):
         json.dump(value, handle)
 
 def print_history(cached):
-    print(f"  {'EPOCH':<8} {'PUBLISHED':<12} {'LEADERBOARD':>12} {'STANDARD':>10} {'ROOM':>8}")
+    cols = [("EPOCH", 8, "<"), ("PRISM", 8, ">"), ("PERFORMANCE", 12, ">"), ("RELIABILITY", 12, ">"), ("READINESS", 10, ">"), ("PENALTY", 8, ">")]
+    top = f"┌{'┬'.join('─' * (w + 2) for _, w, _ in cols)}┐"
+    hdr = f"│ {' │ '.join(f'{name:{align}{w}}' for name, w, align in cols)} │"
+    mid = f"├{'┼'.join('─' * (w + 2) for _, w, _ in cols)}┤"
+    bot = f"└{'┴'.join('─' * (w + 2) for _, w, _ in cols)}┘"
+
+    print(top)
+    print(hdr)
+    print(mid)
     for key in sorted(cached, key=int, reverse=True)[:8]:
         item = cached[key]
-        print(
-            f"  {key:<8} {clock(item.get('publishedAt')):<12} "
-            f"{num(item.get('leaderboard'), 3):>12} "
-            f"{num(item.get('standard'), 3):>10} {num(item.get('room'), 3):>8}"
-        )
+        snap = item.get("snapshot") or {}
+        data = snap.get("data") or {}
+        std_profile = None
+        for p in data.get("profiles") or []:
+            if p.get("workload") == "standard_transfers":
+                std_profile = p
+                break
+
+        if std_profile:
+            prism = std_profile.get("prismFinalScore")
+            perf = std_profile.get("performanceScore")
+            rel = std_profile.get("reliabilityMultiplier")
+            read = std_profile.get("readinessMultiplier")
+            pen = std_profile.get("penaltyMultiplier")
+            if pen is None:
+                pen = data.get("penaltyMultiplier")
+        else:
+            prism = item.get("standard")
+            perf = None
+            rel = None
+            read = None
+            pen = None
+
+        row_vals = [key, num(prism, 3), num(perf, 3), num(rel, 3), num(read, 3), num(pen, 3)]
+        print(f"│ {' │ '.join(f'{val:{cols[i][2]}{cols[i][1]}}' for i, val in enumerate(row_vals))} │")
+    print(bot)
 
 def row_from(item):
     item_data = item.get("data") or {}
@@ -218,30 +281,46 @@ def row_from(item):
         "fetchedAt": time.time(),
     }
 
-def change_line(label, profile, penalty, bandwidth):
-    if label == "performance":
-        return (
-            f"performance {num(profile.get('performanceScore'), 3)}  "
-            f"({points(profile.get('performancePoints24h'))} pts over 24h, verified {bandwidth})"
-        )
-    if label == "reliability":
-        reliable = profile.get("reliableTaskCount")
-        total = profile.get("reliabilityTaskCount")
-        detail = num(profile.get("reliabilityMultiplier"), 3)
-        if reliable is not None and total:
-            missed = int(total) - int(reliable)
-            detail = f"{detail}  ({missed} of {int(total)} accountable tasks unverified)"
-        return f"reliability {detail}"
-    if label == "readiness":
-        return f"readiness {num(profile.get('readinessMultiplier'), 3)}"
-    if label == "penalty":
-        return f"penalty {num(penalty, 3)}"
-    return label
+def get_workload_details(profile, data):
+    reliable = profile.get("reliableTaskCount")
+    total = profile.get("reliabilityTaskCount")
+    reliability = num(profile.get("reliabilityMultiplier"), 3)
+    if reliable is not None and total:
+        reliability = f"{reliability}  ({reliable}/{total})"
+    bandwidth = mbps(profile.get("verifiedBandwidthMbps"))
+    penalty = profile.get("penaltyMultiplier")
+    if penalty is None:
+        penalty = data.get("penaltyMultiplier")
+    factors = [
+        ("performance", profile.get("performanceScore")),
+        ("reliability", profile.get("reliabilityMultiplier")),
+        ("readiness", profile.get("readinessMultiplier")),
+        ("penalty", penalty),
+    ]
+    numbers = [(name, float(value)) for name, value in factors if value is not None and value != ""]
+    bottlenecks = []
+    if numbers:
+        lowest = min(value for _, value in numbers)
+        bottlenecks = [label for label, value in numbers if value == lowest]
+
+    rows = [
+        ("PRISM", num(profile.get("prismFinalScore"), 3)),
+        ("performance", f"{num(profile.get('performanceScore'), 3)}  ({points(profile.get('performancePoints24h'))} pts)"),
+        ("readiness", num(profile.get('readinessMultiplier'), 3)),
+        ("reliability", reliability),
+        ("penalty", num(penalty, 3)),
+        ("confidence", num(profile.get('confidenceScore'), 3)),
+        ("throughput", bandwidth),
+        ("verified bandwidth", bandwidth),
+    ]
+    return rows, bottlenecks
 
 def print_snapshot(snapshot, note):
     data = snapshot.get("data") or {}
     epoch = data.get("epoch") or "—"
-    profiles = sorted(data.get("profiles") or [], key=lambda profile: ORDER.get(profile.get("workload"), 9))
+    mapped = profile_map(snapshot)
+    std = mapped.get("standard_transfers") or {}
+
     print(f"PRISM   epoch {epoch}   published {clock(snapshot.get('publishedAt'))} UTC+8")
     print(f"        observed {clock(snapshot.get('observedAt'))}   pool {data.get('pool') or '—'}   tier {data.get('emissionTier') or '—'}")
     print(f"        leaderboard {num(data.get('emissionPrismTiebreakScore'), 3)}")
@@ -250,70 +329,44 @@ def print_snapshot(snapshot, note):
     if USING_PROXY:
         print("        audit via DataImpulse")
     print()
-    changes = []
-    for profile in profiles:
-        name = (profile.get("workload") or "—").replace("_", " ")
-        reliable = profile.get("reliableTaskCount")
-        total = profile.get("reliabilityTaskCount")
-        reliability = num(profile.get("reliabilityMultiplier"), 3)
-        if reliable is not None and total:
-            reliability = f"{reliability}  ({reliable}/{total})"
-        bandwidth = mbps(profile.get("verifiedBandwidthMbps"))
-        penalty = profile.get("penaltyMultiplier")
-        if penalty is None:
-            penalty = data.get("penaltyMultiplier")
-        factors = [
-            ("performance", profile.get("performanceScore")),
-            ("reliability", profile.get("reliabilityMultiplier")),
-            ("readiness", profile.get("readinessMultiplier")),
-            ("penalty", penalty),
-        ]
-        numbers = [(name, float(value)) for name, value in factors if value is not None and value != ""]
-        bottleneck = "—"
-        if numbers:
-            lowest = min(value for _, value in numbers)
-            factors_low = [label for label, value in numbers if value == lowest]
-            bottleneck = f"{' & '.join(factors_low)} {num(lowest, 3)}"
-            changes.append((name, [change_line(label, profile, penalty, bandwidth) for label in factors_low]))
-        rows = [
-            ("bottleneck", bottleneck),
-            ("PRISM", num(profile.get("prismFinalScore"), 3)),
-            ("performance", f"{num(profile.get('performanceScore'), 3)}  ({points(profile.get('performancePoints24h'))} pts)"),
-            ("readiness", num(profile.get("readinessMultiplier"), 3)),
-            ("reliability", reliability),
-            ("penalty", num(penalty, 3)),
-            ("confidence", num(profile.get("confidenceScore"), 3)),
-            ("throughput", bandwidth),
-            ("verified bandwidth", bandwidth),
-        ]
-        print(f"{name}   pool {profile.get('pool') or '—'}")
-        for label, value in rows:
-            line = f"  {label:<20} {value}"
-            if label == "bottleneck":
-                line = highlight(line)
-            print(line)
-        print()
+
+    std_rows, std_bn = get_workload_details(std, data)
+
+    w1, w2 = 20, 22
+    total_w = w1 + w2 + 3
+
+    top_span = f"┌{'─' * (total_w + 2)}┐"
+    std_hdr = f"standard transfers   pool {std.get('pool') or '—'}"
+    hdr = f"│ {std_hdr:<{total_w}} │"
+    mid_span = f"├{'─' * (w1 + 2)}┬{'─' * (w2 + 2)}┤"
+    bot = f"└{'─' * (w1 + 2)}┴{'─' * (w2 + 2)}┘"
+
+    print(top_span)
+    print(hdr)
+    print(mid_span)
+
+    for s_label, s_val in std_rows:
+        c1 = f"{s_label:<{w1}} │ {s_val:<{w2}}"
+        if s_label in std_bn:
+            c1 = highlight(c1)
+        print(f"│ {c1} │")
+    print(bot)
+    print()
+
     print("LEGEND")
     for label, meaning in GLOSSARY:
         print(f"  {label:<20} {meaning}")
     print()
-    if changes:
-        print("  change")
-        for workload, lines in changes:
-            print(f"    {workload}")
-            for line in lines:
-                print(f"      {line}")
-        print()
 
 # ---------------------------------------------------------------------------
 # Refresh
 #
 # A new public snapshot arrives about once an hour. The audit route allows
-# about one read per window, so a run makes AT MOST ONE audit read, picked in
+# about one read per window, so a direct run makes AT MOST ONE audit read, picked in
 # this order:
 #   1. download the card of an epoch we already know is live   (_nextEpoch)
 #   2. ask which epoch is live, only when the saved card is stale
-#   3. fetch one missing failure record (only when 1 and 2 were not needed)
+# When using proxy or --force, both steps happen in the same run.
 # A refused read (429) holds further reads for the time BeamCore asks for
 # (Retry-After), or for a back-off that starts at BEAM_SCORES_WAIT and doubles.
 # Any successful read clears the hold. --force skips the hold for one run.
@@ -375,6 +428,16 @@ def audit_refused(err):
     audit["_blockedUntil"] = time.time() + wait
     return audit["_blockedUntil"]
 
+def fetch_card(target_epoch):
+    fetched = get_json(scoring_url(target_epoch))
+    if not usable(fetched):
+        raise ScoreError(f"epoch {target_epoch} has no scores yet")
+    cached[target_epoch] = row_from(fetched)
+    save_cache(cached)
+    audit.pop("_nextEpoch", None)
+    audit_ok()
+    return cached[target_epoch].get("snapshot")
+
 if time.time() < blocked_until:
     parts = [f"saved epoch {newest_key}"]
     if next_epoch and next_epoch != str(newest_key):
@@ -384,15 +447,8 @@ if time.time() < blocked_until:
 elif next_epoch:
     called = True
     try:
-        fetched = get_json(scoring_url(next_epoch))
-        if not usable(fetched):
-            raise ScoreError(f"epoch {next_epoch} has no scores yet")
-        cached[next_epoch] = row_from(fetched)
-        save_cache(cached)
+        snapshot = fetch_card(next_epoch)
         newest_key = max(cached, key=int)
-        snapshot = cached[newest_key].get("snapshot")
-        audit.pop("_nextEpoch", None)
-        audit_ok()
     except ScoreError as err:
         if err.status == 429:
             until = audit_refused(err)
@@ -414,6 +470,10 @@ elif not fresh:
         audit_ok()
         if has_card(epoch):
             note = "saved snapshot"
+        elif USING_PROXY or FORCE:
+            audit["_nextEpoch"] = int(epoch)
+            snapshot = fetch_card(epoch)
+            newest_key = max(cached, key=int)
         else:
             audit["_nextEpoch"] = int(epoch)
             note = f"saved epoch {newest_key}; live epoch {epoch} downloads on the next run"
@@ -427,68 +487,6 @@ elif not fresh:
             save_json(TRANSFER_CACHE, audit)
             raise SystemExit(f"scores: BeamCore read failed ({err}), and no saved snapshot yet")
 save_json(TRANSFER_CACHE, audit)
-
-FAILURE_SIDES = {
-    "worker_failed": "your side",
-    "storage_failed": "your side",
-    "path_failed": "your side",
-    "endpoint_failed": "your side",
-    "beam_side": "Beam",
-    "deadline_expired": "timeout or cut",
-    "progress_timeout": "timeout or cut",
-    "no_delivery_cut": "timeout or cut",
-    "tail_cut": "timeout or cut",
-}
-
-def local_transfer_ids():
-    try:
-        with open("data/orchestrator/tasks.json", encoding="utf-8") as handle:
-            records = json.load(handle).get("records") or {}
-    except (OSError, json.JSONDecodeError):
-        return []
-    found = {}
-    for task in records.values():
-        if task.get("state") not in ("failed", "cancelled"):
-            continue
-        transfer_id = task.get("transfer_id")
-        if transfer_id:
-            found[transfer_id] = max(found.get(transfer_id, ""), task.get("updated_at") or "")
-    return [transfer_id for transfer_id, _ in sorted(found.items(), key=lambda item: item[1], reverse=True)]
-
-def walk_attempts(value, found):
-    if isinstance(value, dict):
-        if value.get("failureReason"):
-            found.append(value)
-            return
-        for child in value.values():
-            walk_attempts(child, found)
-    elif isinstance(value, list):
-        for child in value:
-            walk_attempts(child, found)
-
-def print_failures(records):
-    print("FAILURES")
-    shown = False
-    for transfer_id, record in records.items():
-        if str(transfer_id).startswith("_"):
-            continue
-        attempts = []
-        walk_attempts(record.get("body"), attempts)
-        if not attempts:
-            continue
-        shown = True
-        print(f"  {transfer_id}")
-        for attempt in attempts:
-            reason = str(attempt.get("failureReason") or "—")
-            charge = attempt.get("recoveryChargePoints")
-            if charge is None:
-                charge = attempt.get("recoveryCharge")
-            side = FAILURE_SIDES.get(reason, "")
-            suffix = f"  {side}" if side else ""
-            print(f"    {reason:<20} recovery {charge if charge is not None else '—'}{suffix}")
-    if not shown:
-        print("  (none saved yet)")
-    print()
 
 if snapshot:
     print_snapshot(snapshot, note)
@@ -504,38 +502,4 @@ elif note:
     print(f"PRISM   {note}")
     print()
 print_history(cached)
-
-# Failure records share the audit route's one-read budget, so they are only
-# fetched on runs that made no other audit read and are not on hold. That keeps
-# them from ever delaying the epoch refresh.
-transfers = audit
-
-def needs_fetch(transfer_id):
-    record = transfers.get(transfer_id)
-    if not isinstance(record, dict):
-        return True
-    if record.get("body") is not None:
-        return False
-    return float(record.get("retryAt") or 0) <= time.time()
-
-wanted = local_transfer_ids()
-missing = [transfer_id for transfer_id in wanted if needs_fetch(transfer_id)]
-if not called and missing and time.time() >= float(transfers.get("_blockedUntil") or 0):
-    transfer_id = missing[0]
-    audit_url = (
-        f"{API}/v1/audit/transfers/"
-        f"{urllib.parse.quote(transfer_id)}?participantId={urllib.parse.quote(orchestrator_id)}"
-    )
-    try:
-        transfers[transfer_id] = {"body": get_json(audit_url)}
-        audit_ok()
-    except ScoreError as err:
-        if err.status == 429:
-            audit_refused(err)
-        else:
-            # remember the miss so one bad id cannot use up every run's read
-            transfers[transfer_id] = {"body": None, "retryAt": time.time() + FRESH}
-    save_json(TRANSFER_CACHE, transfers)
-print()
-print_failures(transfers)
 PY
