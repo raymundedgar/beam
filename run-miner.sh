@@ -23,7 +23,7 @@ WORKER_UNIT=beam-worker
 TMUX_SESSION=beam
 WATCH_DIRS=(cmd internal go.mod go.sum)
 
-WORKER_CAPABILITIES_DEFAULT='transfer.multipart,transfer.multipart.fanout.v1,transfer.authenticated_part.v1,transfer.source_digest.v1,room.transfer,room.transfer.direct.v1,room.transfer.e2ee.v2,storage.probe.relay.v2'
+WORKER_CAPABILITIES_DEFAULT='transfer.multipart,transfer.multipart.fanout.v1,transfer.authenticated_part.v1,transfer.source_digest.v1,room.transfer,room.transfer.direct.v1,room.transfer.e2ee.v2,room.transfer.lease_renewal.v1,room.transfer.stream_relay.v1,storage.probe.relay.v2'
 ROOM_TRANSFER_ADDR_DEFAULT='0.0.0.0:9470'
 ROOM_TRANSFER_URL_DEFAULT='http://198.58.113.189:9470'
 SUBSYSTEM_MODE_DEFAULT='integrated'
