@@ -10,11 +10,81 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/Beam-Network/beam/internal/workload/contracts"
 )
+
+func TestUploadReuseWorthKeepsAShortTailAndAFastSocket(t *testing.T) {
+	total := int64(50 << 20)
+	proven := float64(20 << 20)
+	slow := float64(1 << 20)
+	if !uploadReuseWorth(40<<20, total, slow, proven) {
+		t.Fatal("10 MiB left at 1 MiB/s was kept against a 20 MiB/s batch")
+	}
+	if uploadReuseWorth(48<<20, total, float64(400<<10), proven) {
+		t.Fatal("a 2 MiB tail was re-uploaded")
+	}
+	if uploadReuseWorth(24<<20, total, float64(8<<20), proven) {
+		t.Fatal("an 8 MiB/s socket was discarded")
+	}
+	if uploadReuseWorth(40<<20, total, slow, float64(5<<20)) {
+		t.Fatal("a 5 MiB/s sibling was treated as proof")
+	}
+	if uploadReuseWorth(40<<20, total, slow, 0) {
+		t.Fatal("a batch with no finished upload was re-uploaded")
+	}
+}
+
+func TestSlowUploadYieldsToAFinishedBatchRate(t *testing.T) {
+	batchPuts.note("batch-tail", float64(20<<20))
+	ctx := withBatch(context.Background(), "batch-tail")
+	ctx, cancel := context.WithCancelCause(ctx)
+	defer cancel(context.Canceled)
+	var n atomic.Int64
+	n.Store(30 << 20)
+	go func() {
+		ticker := time.NewTicker(20 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				n.Add(20 << 10)
+			}
+		}
+	}()
+	go watchPutRecent(ctx, cancel, 50<<20, 40*time.Millisecond, 0,
+		func() (int64, bool) { return n.Load(), true },
+		func() tcpSnap { return tcpSnap{ok: true, sndWnd: 1 << 20} },
+		func() bool { return false },
+		func() bool { return true },
+		&putPace{}, nil, nil, nil, true)
+	select {
+	case <-ctx.Done():
+		if context.Cause(ctx) != errReplaced {
+			t.Fatalf("cause %v", context.Cause(ctx))
+		}
+	case <-time.After(time.Second):
+		t.Fatal("kept a large slow tail after the batch had finished an upload at 20 MiB/s")
+	}
+}
+
+func TestMedianStaysOpenForOneTryPastTheCap(t *testing.T) {
+	var pace readPace
+	if !medianOpen(readRestartCap, &pace, false) {
+		t.Fatal("the socket under the cap was left to finish")
+	}
+	if medianOpen(readRestartCap+1, &pace, false) {
+		t.Fatal("restarts continued past the extra try")
+	}
+	if medianOpen(0, &pace, true) {
+		t.Fatal("a frozen download was restarted")
+	}
+}
 
 func TestPolicyStampUsesTheEmbeddedRevision(t *testing.T) {
 	t.Log(policyStamp())

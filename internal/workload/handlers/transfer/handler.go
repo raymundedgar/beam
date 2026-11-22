@@ -491,7 +491,7 @@ func (h *Handler) readSourcePublish(ctx context.Context, part contracts.Transfer
 				traceFrom(ctx).readFrozen(buf.Len(), idle)
 			}
 		}
-		body, err := h.readSourceOnce(ctx, part, replacements < maxSourceReplacements && !frozen, replacements < readRestartCap && !pace.done() && !frozen, buf, &pace, &stamp)
+		body, err := h.readSourceOnce(ctx, part, replacements < maxSourceReplacements && !frozen, medianOpen(replacements, &pace, frozen), buf, &pace, &stamp)
 		if err == nil {
 			if buf != nil {
 				buf.finish()
@@ -1146,6 +1146,11 @@ func (h *Handler) putPresignedOnce(ctx context.Context, part contracts.TransferP
 	}
 	if h.gate != nil {
 		h.gate.markDelivered(lease.batch)
+	}
+	if acked > 0 {
+		if dur := time.Since(started); dur > 0 {
+			batchPuts.note(batchFrom(ctx), float64(acked)/dur.Seconds())
+		}
 	}
 	etag := strings.Trim(destinationResponse.Header.Get("ETag"), `"`)
 	sent := hex.EncodeToString(sentMD5.Sum(nil))

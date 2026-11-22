@@ -140,6 +140,65 @@ func (w *ackWindows) push(now time.Time, acked int64, window time.Duration, minR
 	return true, rate, w.lows
 }
 
+// putProvenMinRate is the slowest finished upload that can stand in for the
+// rest of its batch. A 5 MiB/s success is not evidence the next socket will
+// be fast. putReuseMinRemain keeps a short tail: discarding 2–3 MiB that
+// was already acknowledged, on 18:14 and 20:43, took about 25s to replace.
+// putReuseMargin is how much longer the tail must be than a full re-upload
+// before the slow socket is dropped.
+const (
+	putProvenMinRate  = 8 << 20
+	putReuseMinRemain = 6 << 20
+	putReuseMargin    = 3 * time.Second
+)
+
+// uploadReuseWorth is true when a fully sent body is acknowledging slower
+// than the keep rate, a large remainder is left, and a finished upload in
+// this batch was fast enough that sending the whole part again still beats
+// waiting.
+func uploadReuseWorth(acked, total int64, recent, proven float64) bool {
+	if proven < float64(putProvenMinRate) || recent <= 0 || recent >= float64(putAckMinRate) || total <= 0 || acked < 0 {
+		return false
+	}
+	remain := total - acked
+	if remain < putReuseMinRemain || putInTail(acked, total) {
+		return false
+	}
+	left := float64(remain) / recent
+	again := float64(total)/proven + putReuseMargin.Seconds()
+	return left > again
+}
+
+type batchPutRates struct {
+	mu sync.Mutex
+	m  map[string]float64
+}
+
+func (b *batchPutRates) note(batch string, bytesPerSec float64) {
+	if b == nil || batch == "" || bytesPerSec < float64(putProvenMinRate) {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.m == nil {
+		b.m = map[string]float64{}
+	}
+	if bytesPerSec > b.m[batch] {
+		b.m[batch] = bytesPerSec
+	}
+}
+
+func (b *batchPutRates) best(batch string) float64 {
+	if b == nil || batch == "" {
+		return 0
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.m[batch]
+}
+
+var batchPuts batchPutRates
+
 // putSlowStreak is how many consecutive slow seconds discard an upload.
 // A socket that has already acknowledged 16 MiB, or half the object, can sit
 // through a short pause. Four slow seconds means the rate really stayed low.
@@ -329,6 +388,21 @@ func watchPutRecent(ctx context.Context, cancel context.CancelCauseFunc, total i
 			if onLate != nil && !lateSent && zeros >= 2 {
 				lateSent = true
 				onLate()
+			}
+			// A sibling that has already finished fast can take over a large
+			// slow tail. A short tail stays: the 18:14 and 20:43 discards of
+			// a nearly finished body took longer than waiting.
+			if bodyDone != nil && bodyDone() && cancel != nil && allowDiscard && uploadReuseWorth(progress, total, rate, batchPuts.best(batchFrom(ctx))) {
+				if pace == nil || !pace.notFaster(int64(rate)) {
+					if pace != nil {
+						pace.discarded(int64(rate))
+					}
+					if onStall != nil && !peerWindowBlocked(snap) {
+						onStall(rate, n, snap, "batch_fast", 0, progress)
+					}
+					cancel(errReplaced)
+					return
+				}
 			}
 			stall := lows >= putSlowStreak(progress, total)
 			if rate == 0 && putInTail(progress, total) {

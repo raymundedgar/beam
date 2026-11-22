@@ -139,6 +139,17 @@ func keepMeasuredRate(budget time.Duration, moved int64, elapsed time.Duration) 
 	return budget >= time.Second && readFastEnough(moved, elapsed)
 }
 
+// medianOpen keeps the median restart available for one try past the cap.
+// After the cap, a socket under the keep rate was left to finish: the 01:43
+// reads ran at 1.5 MiB/s for 32s. The extra try still stops when a
+// replacement is not faster than the socket it replaced.
+func medianOpen(replacements int, pace *readPace, frozen bool) bool {
+	if frozen || (pace != nil && pace.done()) {
+		return false
+	}
+	return replacements < readRestartCap+1
+}
+
 func readRestartWorth(have, total int64, current, median float64) bool {
 	if median <= 0 || current <= 0 || total <= 0 || have >= total || have < 0 {
 		return false
