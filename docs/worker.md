@@ -68,7 +68,7 @@ export BEAM_WCP_SERVER_NAME=orchestrator.example.com
 
 ./bin/beam-worker serve \
   --node-key data/worker/node.key \
-  --capabilities transfer.multipart,transfer.multipart.fanout.v1,transfer.authenticated_part.v1,transfer.source_digest.v1,room.transfer,room.transfer.direct.v1,room.transfer.e2ee.v2,room.transfer.lease_renewal.v1,storage.probe.relay.v2 \
+  --capabilities transfer.multipart,transfer.multipart.fanout.v1,transfer.authenticated_part.v1,transfer.source_digest.v1,room.transfer,room.transfer.direct.v1,room.transfer.e2ee.v2,room.transfer.lease_renewal.v1,room.transfer.stream_relay.v1,storage.probe.relay.v2 \
   --room-transfer-addr 0.0.0.0:9470 \
   --room-transfer-advertise-url http://worker.example.com:9470
 ```
@@ -156,7 +156,9 @@ bearer credential arrives in the offer's destination headers, and the worker
 sends it only with that destination's upload requests.
 
 Destinations without a protocol keep the presigned path (`presigned_put`),
-which streams the range with `PUT`; an offered `method` applies only to the
+which streams the range with `PUT`. After a 408, 429 or 5xx answer from the
+source or destination, the worker reads and writes the range again, up to three
+attempts within the assignment lease. An offered `method` applies only to the
 authenticated protocols.
 
 For an authenticated destination the worker:
