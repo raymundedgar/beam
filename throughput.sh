@@ -33,6 +33,25 @@ EMISSION_EVERY = 5 * 60
 EMISSION_PATH = "data/analytics/emission.json"
 BTCLI = os.environ.get("BTCLI", "/root/beam/.venv/bin/btcli")
 IN_FLIGHT = {"received", "offered", "reserved", "committed", "running", "starting"}
+# Local pool. w1 is this orchestrator's own worker.
+WORKERS = {
+    "b0f59a79-8cce-4137-af3a-84c16a1b61fc": ("w1", "198.58.113.189"),
+    "3278bea7-6dc2-4b46-b84c-10516be0e4ac": ("w2", "173.255.192.120"),
+    "ed8b526a-9f7a-4660-913f-17268e8cd337": ("w3", "45.33.120.60"),
+    "861d023f-16c0-42f0-9e70-5db1b2d459d5": ("w4", "104.200.20.75"),
+    "a5979750-9f01-419b-9b4e-42eac2336089": ("w5", "72.14.185.75"),
+    "7487a1e8-aa29-4b3a-867c-5424b97f5d09": ("w6", "69.164.198.44"),
+}
+
+def worker_of(task):
+    raw = task.get("worker_id") or ""
+    if not raw:
+        identity = (task.get("spec") or {}).get("identity") or {}
+        raw = identity.get("worker_id") or ""
+    known = WORKERS.get(raw)
+    if known:
+        return known[0]
+    return raw[:8] if raw else "—"
 
 def fetch_tasks():
     req = urllib.request.Request(
@@ -526,6 +545,7 @@ def enrich(task, medians, pace):
         "created": parse_time(task.get("created_at")),
         "in_flight": state in IN_FLIGHT,
         "task_id": (task.get("external_id") or "")[:8],
+        "worker": worker_of(task),
         "stop": stop_reason(task),
         "region": regions_of(task),
         "batch_id": batch_id_of(task),
@@ -627,13 +647,14 @@ def write_unsuccessful(tasks):
         lines.append("None right now.")
     else:
         lines += [
-            "| KIND | STATE | REGION | BATCH ID | CREATED | UPDATED | STOP | REASON |",
-            "| --- | --- | --- | --- | --- | --- | --- | --- |",
+            "| KIND | WORKER | STATE | REGION | BATCH ID | CREATED | UPDATED | STOP | REASON |",
+            "| --- | --- | --- | --- | --- | --- | --- | --- | --- |",
         ]
         for task in sorted(bad, key=lambda item: item.get("updated_at") or "", reverse=True):
             lines.append(
-                "| {kind} | {state} | {region} | {batch_id} | {created} | {updated} | {stop} | {reason} |".format(
+                "| {kind} | {worker} | {state} | {region} | {batch_id} | {created} | {updated} | {stop} | {reason} |".format(
                     kind=kind_of(task),
+                    worker=worker_of(task),
                     state=task.get("state") or "-",
                     region=regions_of(task),
                     batch_id=batch_id_of(task),
@@ -680,14 +701,15 @@ def print_rows(rows):
         print("  (none)")
         return
 
+    print("  " + "   ".join(f"{label} {ip}" for label, ip in WORKERS.values()))
     print(
-        f"  {'TASK ID':<8}  {'KIND':<7}  "
+        f"  {'TASK ID':<8}  {'WORKER':<6}  {'KIND':<7}  "
         f"{'TIME':>7}  {'DL TIME':>8}  {'UL TIME':>8}  "
         f"{'DL STALL':>8}  {'UL STALL':>8}  "
         f"{'RATE':>10}  {'DL RATE':>7}  {'UL RATE':>7}  "
         f"{'STARTED':>11}  {'REGION':<10}  {'STOP'}"
     )
-    print("  " + "-" * 127)
+    print("  " + "-" * 136)
 
     batches = defaultdict(list)
     for row in rows:
@@ -701,6 +723,7 @@ def print_rows(rows):
             stop_str = format_stop(row.get("state"), row.get("stop"), row.get("in_flight"), row.get("starved", 0.0))
             line = (
                 f"  {(row.get('task_id') or '—'):<8}  "
+                f"{(row.get('worker') or '—'):<6}  "
                 f"{row['kind']:<7}  "
                 f"{fmt_secs(row['seconds']):>7}  "
                 f"{fmt_sec_val(row.get('dl_time')):>8}  "
