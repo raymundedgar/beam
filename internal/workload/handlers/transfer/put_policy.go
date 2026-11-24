@@ -174,6 +174,41 @@ type batchPutRates struct {
 	m  map[string]float64
 }
 
+// putReplaceRef is the rate assumed for a replacement socket when no upload
+// in the batch has finished fast enough to prove one. Over 24 hours of logs,
+// 96 replacements that followed a slow-rate discard finished in a median
+// 2.2s at a median 22 MiB/s; the slowest quarter ran under 8.8 MiB/s. Ten
+// MiB/s is deliberately below the median. BEAM_WORKER_UL_REPLACE_REF sets it
+// in MiB/s; 0 turns the projected-finish discard off.
+var putReplaceRef = int64(10 << 20)
+
+// putProjectedStreak is how many consecutive ~1s windows must project a
+// finish later than a fresh upload would take. Two windows caught ramping
+// sockets in a replay of the same logs; three kept the saving on most of the
+// slow tails and fired on far fewer uploads that went on to finish.
+const putProjectedStreak = 3
+
+// uploadProjectedWorth is true when finishing this socket at its recent rate
+// would take longer than sending the whole part again at the proven rate of a
+// finished sibling, or at putReplaceRef when none has finished. Unlike
+// uploadReuseWorth it does not wait for the body to be fully written and it
+// has no 3 MiB/s ceiling: a socket at 4 MiB/s with 40 MiB left still loses to
+// a fresh one. A short remainder and the tail stay put.
+func uploadProjectedWorth(acked, total int64, recent, proven float64) bool {
+	ref := float64(putReplaceRef)
+	if ref <= 0 || recent <= 0 || total <= 0 || acked < 0 {
+		return false
+	}
+	if proven > ref {
+		ref = proven
+	}
+	remain := total - acked
+	if remain < putReuseMinRemain || putInTail(acked, total) {
+		return false
+	}
+	return float64(remain)/recent > float64(total)/ref+putReuseMargin.Seconds()
+}
+
 func (b *batchPutRates) note(batch string, bytesPerSec float64) {
 	if b == nil || batch == "" || bytesPerSec < float64(putProvenMinRate) {
 		return
@@ -246,9 +281,20 @@ const putHoldTailCap = 25 * time.Second
 
 const putHoldDiscardMax = 2
 
+// putHoldEarly is how long a closed window is kept before this attempt has
+// acknowledged 16 MiB. The 10:43 wave sat in hold_rwnd from the first seconds
+// and was taken back at 7.9s with nothing delivered. Two seconds leaves time
+// for another socket to finish before that cut. A socket that already
+// acknowledged 16 MiB keeps the configured hold: discarding one of those and
+// drawing a slower replacement threw away a large send. 0 turns it off.
+var putHoldEarly = 2 * time.Second
+
 func holdLimit(progress, total int64) time.Duration {
 	if putInTail(progress, total) || putHoldCap <= 0 {
 		return putHoldTailCap
+	}
+	if putHoldEarly > 0 && progress < putAckKeep && putHoldEarly < putHoldCap {
+		return putHoldEarly
 	}
 	return putHoldCap
 }
@@ -286,6 +332,7 @@ func watchPutRecent(ctx context.Context, cancel context.CancelCauseFunc, total i
 	var windows ackWindows
 	attemptAcked := int64(-1)
 	var zeros int
+	var projected int
 	lateSent := false
 	// held counts only ticks where the window is closed and this attempt still
 	// has body bytes to send. respHeld counts a fully written body waiting for
@@ -403,6 +450,24 @@ func watchPutRecent(ctx context.Context, cancel context.CancelCauseFunc, total i
 					cancel(errReplaced)
 					return
 				}
+			}
+			// A socket whose recent rate projects a finish later than a fresh
+			// upload would take is replaced even before its body is fully
+			// written and even above the 3 MiB/s keep rate. Three windows in
+			// a row, and pace.notFaster keeps a replacement that is not
+			// faster than the socket it replaced.
+			if cancel != nil && allowDiscard && uploadProjectedWorth(progress, total, rate, batchPuts.best(batchFrom(ctx))) {
+				projected++
+			} else {
+				projected = 0
+			}
+			if projected >= putProjectedStreak && !pace.notFaster(int64(rate)) {
+				pace.discarded(int64(rate))
+				if onStall != nil && !peerWindowBlocked(snap) {
+					onStall(rate, n, snap, "projected_slow", 0, progress)
+				}
+				cancel(errReplaced)
+				return
 			}
 			stall := lows >= putSlowStreak(progress, total)
 			if rate == 0 && putInTail(progress, total) {

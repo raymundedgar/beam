@@ -71,6 +71,10 @@ func TestSndBufSetDoublesAndLocksBelowAutotune(t *testing.T) {
 }
 
 func TestTailStallKeepsTheUploadUntilEightSeconds(t *testing.T) {
+	// These assert the configured long hold, not the early give-up.
+	prevEarly := putHoldEarly
+	putHoldEarly = 0
+	t.Cleanup(func() { putHoldEarly = prevEarly })
 	if !putPolicy {
 		t.Skip("discard policy is off")
 	}

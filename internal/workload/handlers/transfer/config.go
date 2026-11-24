@@ -125,6 +125,11 @@ func init() {
 			transferReserveSlots = parsed
 		}
 	}
+	if raw := os.Getenv("BEAM_WORKER_UL_REPLACE_REF"); raw != "" {
+		if parsed, err := strconv.ParseFloat(raw, 64); err == nil && parsed >= 0 {
+			putReplaceRef = int64(parsed * (1 << 20))
+		}
+	}
 	if raw := os.Getenv("BEAM_WORKER_UL_MAX_DISCARDS"); raw != "" {
 		if parsed, err := strconv.Atoi(raw); err == nil && parsed >= 0 {
 			putMaxDiscards = parsed

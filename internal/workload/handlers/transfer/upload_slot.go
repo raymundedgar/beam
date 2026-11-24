@@ -309,22 +309,36 @@ func (g *uploadGate) markDelivered(batch string) {
 	g.mu.Unlock()
 }
 
+// acquirePriority waits for a handoff from the gate. It reports the wait the
+// way take does: one upload_wait line with the current token holders once the
+// wait passes uploadWaitLog, and the total wait added to slot_wait. Without
+// this, a worker running BEAM_WORKER_UL_PRIORITY=true never logged who was
+// holding the tokens while other tasks starved.
 func (l *sendLease) acquirePriority(ctx context.Context, tokens chan struct{}) error {
+	start := time.Now()
 	w := &sendWaiter{
 		lease:    l,
 		grant:    make(chan struct{}, 1),
-		queuedAt: time.Now(),
+		queuedAt: start,
 		upload:   l.uploadID(),
 		batch:    l.batchID(),
 	}
 	l.gate.enqueue(w)
 	l.gate.choose()
-	select {
-	case <-w.grant:
-		return nil
-	case <-ctx.Done():
-		l.gate.cancelWait(w, tokens)
-		return ctx.Err()
+	timer := time.NewTimer(uploadWaitLog)
+	defer timer.Stop()
+	for {
+		select {
+		case <-w.grant:
+			traceFrom(ctx).addSlotWait(time.Since(start))
+			return nil
+		case <-timer.C:
+			traceFrom(ctx).uploadWait(time.Since(start), l.gate.holders())
+		case <-ctx.Done():
+			l.gate.cancelWait(w, tokens)
+			traceFrom(ctx).addSlotWait(time.Since(start))
+			return ctx.Err()
+		}
 	}
 }
 

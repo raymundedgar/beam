@@ -372,10 +372,115 @@ func TestTailHoldKeepsTheLongCap(t *testing.T) {
 	putHoldCap = 50 * time.Millisecond
 	t.Cleanup(func() { putHoldCap = prev })
 	if holdLimit(10<<20, 50<<20) != putHoldCap {
-		t.Fatal("a non-tail upload ignored the configured cap")
+		t.Fatal("a configured hold shorter than the early give-up was lengthened")
 	}
 	if holdLimit(45<<20, 50<<20) != putHoldTailCap {
 		t.Fatal("a tail upload used the short cap")
+	}
+}
+
+func TestClosedWindowGivesUpBeforeTheCutWhenLittleIsAcked(t *testing.T) {
+	prev := putHoldCap
+	putHoldCap = 10 * time.Second
+	t.Cleanup(func() { putHoldCap = prev })
+	if holdLimit(4<<20, 50<<20) != putHoldEarly {
+		t.Fatal("a 4 MiB upload waited out the long hold")
+	}
+	if holdLimit(20<<20, 50<<20) != putHoldCap {
+		t.Fatal("a 20 MiB upload was given the early hold")
+	}
+}
+
+func TestUploadProjectedWorth(t *testing.T) {
+	prev := putReplaceRef
+	t.Cleanup(func() { putReplaceRef = prev })
+	putReplaceRef = 10 << 20
+	total := int64(50 << 20)
+	if !uploadProjectedWorth(10<<20, total, float64(4<<20), 0) {
+		t.Fatal("40 MiB left at 4 MiB/s kept against a 10 MiB/s fresh socket")
+	}
+	if uploadProjectedWorth(10<<20, total, float64(20<<20), 0) {
+		t.Fatal("a 20 MiB/s socket was replaced")
+	}
+	if uploadProjectedWorth(46<<20, total, float64(1<<20), 0) {
+		t.Fatal("a tail was replaced")
+	}
+	if uploadProjectedWorth(10<<20, total, 0, 0) {
+		t.Fatal("a zero rate was projected")
+	}
+	if !uploadProjectedWorth(10<<20, total, float64(8<<20), float64(40<<20)) {
+		t.Fatal("a proven 40 MiB/s sibling did not raise the reference")
+	}
+	putReplaceRef = 0
+	if uploadProjectedWorth(10<<20, total, float64(1<<20), 0) {
+		t.Fatal("projection ran with the reference off")
+	}
+}
+
+func TestProjectedSlowSocketIsReplacedAfterAStreak(t *testing.T) {
+	prev := putReplaceRef
+	t.Cleanup(func() { putReplaceRef = prev })
+	putReplaceRef = 10 << 20
+	ctx, cancel := context.WithCancelCause(context.Background())
+	defer cancel(context.Canceled)
+	var n atomic.Int64
+	n.Store(4 << 20)
+	go func() {
+		ticker := time.NewTicker(10 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				n.Add(40 << 10) // ~4 MiB/s
+			}
+		}
+	}()
+	go watchPutRecent(ctx, cancel, 50<<20, 40*time.Millisecond, 0,
+		func() (int64, bool) { return n.Load(), true },
+		func() tcpSnap { return tcpSnap{ok: true, sndWnd: 1 << 20} },
+		func() bool { return false },
+		func() bool { return false },
+		&putPace{}, nil, nil, nil, true)
+	select {
+	case <-ctx.Done():
+		if context.Cause(ctx) != errReplaced {
+			t.Fatalf("cause %v", context.Cause(ctx))
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("a socket projected to finish far after a fresh one was kept")
+	}
+}
+
+func TestUploadWaitLoggedWhenPriorityStarved(t *testing.T) {
+	useUploadPriority(t, time.Hour)
+	prev := uploadWaitLog
+	uploadWaitLog = 20 * time.Millisecond
+	t.Cleanup(func() { uploadWaitLog = prev })
+	var mu sync.Mutex
+	var lines []string
+	trace := &transferLog{workload: "w", attempt: "a", printf: func(format string, args ...any) {
+		mu.Lock()
+		lines = append(lines, fmt.Sprintf(format, args...))
+		mu.Unlock()
+	}}
+	gate := newUploadGate(make(chan struct{}, 1), make(chan struct{}, 4))
+	holder := leaseFor(gate, "holder", "b1", "u1")
+	if err := holder.acquireSend(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	defer holder.releaseSend()
+	waiter := leaseFor(gate, "waiter", "b2", "u2")
+	ctx, cancel := context.WithTimeout(withTrace(context.Background(), trace), 150*time.Millisecond)
+	defer cancel()
+	if err := waiter.acquireSend(ctx); err == nil {
+		t.Fatal("waiter acquired a held token")
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if !strings.Contains(strings.Join(lines, "\n"), "upload_wait") {
+		t.Fatalf("no upload_wait line: %v", lines)
 	}
 }
 
